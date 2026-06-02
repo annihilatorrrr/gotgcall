@@ -113,7 +113,7 @@ func NewGroupCall(chatID int64, factory *wrtc.Factory, disp *utils.Dispatcher, l
 	return gc, nil
 }
 
-func (g *GroupCall) Mode() string { return "webrtc" }
+func (*GroupCall) Mode() string { return "webrtc" }
 
 func (g *GroupCall) CreateLocalParams() (string, error) {
 	if g.closed.Load() {

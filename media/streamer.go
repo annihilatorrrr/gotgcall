@@ -227,4 +227,4 @@ func (s *Streamer) ElapsedMs() uint64 { return s.msSent.Load() }
 
 type panicErr struct{ v any }
 
-func (p panicErr) Error() string { return "streamer panic" }
+func (panicErr) Error() string { return "streamer panic" }

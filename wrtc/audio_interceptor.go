@@ -23,7 +23,7 @@ const (
 // them to listeners); pion's defaults do not stamp these for us.
 type audioLevelInterceptorFactory struct{}
 
-func (f *audioLevelInterceptorFactory) NewInterceptor(string) (interceptor.Interceptor, error) {
+func (*audioLevelInterceptorFactory) NewInterceptor(string) (interceptor.Interceptor, error) {
 	return &audioLevelInterceptor{}, nil
 }
 
@@ -48,7 +48,7 @@ type audioLevelInterceptor struct {
 	interceptor.NoOp
 }
 
-func (a *audioLevelInterceptor) BindLocalStream(info *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
+func (*audioLevelInterceptor) BindLocalStream(info *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
 	s := &audioLevelStream{absSendBuf: make([]byte, 3)}
 	for _, ext := range info.RTPHeaderExtensions {
 		switch ext.URI {
@@ -79,7 +79,6 @@ func (a *audioLevelInterceptor) BindLocalStream(info *interceptor.StreamInfo, wr
 	})
 }
 
-
 // markerClearInterceptorFactory fixes RTP marker on outbound audio.
 // Pion's packetizer marks every single-payload Opus packet, but per
 // RFC 7587 the marker should only be set on the first packet after
@@ -88,7 +87,7 @@ func (a *audioLevelInterceptor) BindLocalStream(info *interceptor.StreamInfo, wr
 // marker=false to avoid jitter-buffer resync on every frame.
 type markerClearInterceptorFactory struct{}
 
-func (f *markerClearInterceptorFactory) NewInterceptor(string) (interceptor.Interceptor, error) {
+func (*markerClearInterceptorFactory) NewInterceptor(string) (interceptor.Interceptor, error) {
 	return &markerClearInterceptor{}, nil
 }
 
@@ -96,7 +95,7 @@ type markerClearInterceptor struct {
 	interceptor.NoOp
 }
 
-func (m *markerClearInterceptor) BindLocalStream(info *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
+func (*markerClearInterceptor) BindLocalStream(info *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
 	if !strings.HasPrefix(info.MimeType, "audio/") {
 		return writer
 	}

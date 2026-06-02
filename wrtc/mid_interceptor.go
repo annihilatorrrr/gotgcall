@@ -25,7 +25,7 @@ import (
 // below in lockstep.
 type midStampInterceptorFactory struct{}
 
-func (f *midStampInterceptorFactory) NewInterceptor(string) (interceptor.Interceptor, error) {
+func (*midStampInterceptorFactory) NewInterceptor(string) (interceptor.Interceptor, error) {
 	return &midStampInterceptor{}, nil
 }
 
@@ -33,7 +33,7 @@ type midStampInterceptor struct {
 	interceptor.NoOp
 }
 
-func (m *midStampInterceptor) BindLocalStream(info *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
+func (*midStampInterceptor) BindLocalStream(info *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
 	var midExtID uint8
 	for _, ext := range info.RTPHeaderExtensions {
 		if ext.URI == sdesMidURI {
