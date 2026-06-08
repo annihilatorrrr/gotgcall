@@ -121,7 +121,8 @@ func NewStack(opts Options) (*Stack, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 
-	agentOpts := []ice.AgentOption{}
+	var agentOpts []ice.AgentOption
+
 	if len(opts.NetworkTypes) > 0 {
 		agentOpts = append(agentOpts, ice.WithNetworkTypes(opts.NetworkTypes))
 	} else {
