@@ -143,6 +143,18 @@ func NewStack(opts Options) (*Stack, error) {
 	if opts.IPFilter != nil {
 		agentOpts = append(agentOpts, ice.WithIPFilter(opts.IPFilter))
 	}
+	// Tune pion's connectivity-loss thresholds. Defaults (5s disconnected,
+	// 25s failed) are tight for our setup — a brief flap during DTLS or
+	// early media can trip Disconnected before recovery. 10s/30s gives
+	// pion room to re-validate the nominated pair without flapping the
+	// high-level state machine. KeepaliveInterval matches the default
+	// but pinning it documents intent: 2s STUN bindings keep NAT mappings
+	// warm without flooding.
+	agentOpts = append(agentOpts,
+		ice.WithDisconnectedTimeout(10*time.Second),
+		ice.WithFailedTimeout(30*time.Second),
+		ice.WithKeepaliveInterval(2*time.Second),
+	)
 
 	agent, err := ice.NewAgentWithOptions(agentOpts...)
 	if err != nil {

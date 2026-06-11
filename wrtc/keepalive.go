@@ -17,10 +17,12 @@ import (
 const (
 	keepaliveTickInterval = 2 * time.Second
 	monitorPollInterval   = time.Second
-	// iceCheckingTimeout — how long a PC may stay outside Connected before
-	// the monitor force-closes it. Must exceed the SetSource gate (10s by
-	// default) so the caller's own timeout fires first with a clean error.
-	iceCheckingTimeout = 15 * time.Second
+	// iceCheckingTimeout — how long a PC that has NEVER reached Connected
+	// may stay in setup before the monitor force-closes it. Must exceed
+	// both the SetSource gate (10s default) and pion's failedTimeout (30s
+	// after NewStack's tuning) so the caller's own error path and pion's
+	// internal Failed transition both fire first with cleaner signals.
+	iceCheckingTimeout = 35 * time.Second
 )
 
 // FactoryMonitor is a SINGLE per-Factory goroutine that
@@ -131,17 +133,29 @@ func (m *FactoryMonitor) run() {
 
 // pcMonitorEntry is one PC's per-tick state. checkingNs is the monotonic
 // UnixNano when the PC was first observed outside Connected; it resets
-// once the PC reaches Connected. Atomics avoid a per-entry mutex.
+// once the PC reaches Connected. everConnected is sticky once true and
+// suppresses the force-close path so pion can recover transient mid-call
+// disconnects on its own (failedTimeout governs the terminal verdict).
+// Atomics avoid a per-entry mutex.
 type pcMonitorEntry struct {
-	pc         *PeerConnection
-	log        *slog.Logger
-	checkingNs atomic.Int64
+	pc            *PeerConnection
+	log           *slog.Logger
+	checkingNs    atomic.Int64
+	everConnected atomic.Bool
 }
 
 func (e *pcMonitorEntry) tick(doKeepalive bool) {
 	state := e.pc.State()
 
 	if state != models.Connected {
+		// Once a PC has reached Connected, a later Disconnected /
+		// Connecting / Failed is pion's to resolve within its own
+		// failedTimeout. The watchdog's job is the leak case: a PC
+		// that never connects and whose caller forgot to Close. Skip
+		// after first connect so recovery isn't preempted.
+		if e.everConnected.Load() {
+			return
+		}
 		now := time.Now().UnixNano()
 		if start := e.checkingNs.Load(); start == 0 {
 			e.checkingNs.Store(now)
@@ -156,6 +170,7 @@ func (e *pcMonitorEntry) tick(doKeepalive bool) {
 		}
 		return
 	}
+	e.everConnected.Store(true)
 	e.checkingNs.Store(0)
 
 	if doKeepalive {
