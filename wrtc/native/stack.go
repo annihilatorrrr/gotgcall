@@ -21,6 +21,10 @@ import (
 	"github.com/annihilatorrrr/gotgcall/wrtc/jsonparams"
 )
 
+// preAcceptDelay is the hardcoded pause between AddRemoteCandidate and
+// agent.Accept. See Stack.Connect for the rationale.
+const preAcceptDelay = 250 * time.Millisecond
+
 // ConnStateFn is invoked when the stack's high-level connection state
 // transitions. Replaces pion/webrtc's OnConnectionStateChange.
 type ConnStateFn func(models.ConnState)
@@ -252,6 +256,20 @@ func (s *Stack) Connect(ctx context.Context, remoteJSON string) error {
 		if addErr = s.agent.AddRemoteCandidate(cand); addErr != nil {
 			s.log.Warn("AddRemoteCandidate failed", slog.Int("i", i), slog.Any("err", addErr))
 		}
+	}
+
+	// Brief pause before Accept: Telegram's SFU sometimes hasn't registered
+	// our ufrag/pwd by the time JoinGroupCall returns. Without this gap,
+	// pion's first STUN bindings get auth-fail responses, the SFU's later
+	// DTLS path lags behind ICE nomination, and the symptom downstream is
+	// "dtls handshake: context deadline exceeded" — even though ICE itself
+	// eventually completed. 250 ms covers the typical 150-200 ms SFU
+	// registration window; imperceptible to users, no caller knob (ntgcalls
+	// doesn't expose one either).
+	select {
+	case <-time.After(preAcceptDelay):
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
 	// Accept = ICE-CONTROLLED. Pion sends checks outbound from our host
