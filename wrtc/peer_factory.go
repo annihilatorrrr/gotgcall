@@ -6,24 +6,12 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/pion/ice/v4"
-	"github.com/pion/stun/v3"
 
 	"github.com/annihilatorrrr/gotgcall/models"
 	"github.com/annihilatorrrr/gotgcall/wrtc/native"
 )
-
-// ICEServer mirrors the historical wrtc.ICEServer shape so callers
-// constructed with WithICEServers don't have to know about pion's
-// stun.URI type. URLs are strings in the standard scheme://host:port
-// form ("stun:stun.l.google.com:19302", "turn:turn.example.com:3478").
-type ICEServer struct {
-	Username   string
-	Credential string
-	URLs       []string
-}
 
 // NetworkType is the candidate network-type tag the legacy API exposed.
 // Values are the same constants pion uses internally so callers don't
@@ -52,34 +40,17 @@ type Factory struct {
 	closed bool
 }
 
-// FactoryOptions matches the historical public shape so the gotgcall
-// top-level Client wires up without churn. Unsupported / removed fields
-// are accepted-but-ignored so old call sites still compile.
+// FactoryOptions configures the per-process Factory. ICE timing,
+// per-pair binding budgets, and STUN/TURN servers are handled
+// internally — no caller knob, matching ntgcalls.
 type FactoryOptions struct {
 	Logger *slog.Logger
-	// ICEServers populates the STUN/TURN candidate sources the native ICE
-	// agent reaches out to. Empty = host-only (recommended for Telegram).
-	ICEServers []ICEServer
 	// NetworkTypes whitelists the candidate network types. Empty = UDP4+UDP6.
 	NetworkTypes []NetworkType
 	CertPoolSize int
-	// ICEDisconnectTimeout / ICEFailedTimeout / ICEKeepaliveInterval are
-	// retained for API parity but currently unused — pion/ice/v4's
-	// defaults are aggressive enough for our flow.
-	ICEDisconnectTimeout time.Duration
-	ICEFailedTimeout     time.Duration
-	ICEKeepaliveInterval time.Duration
-	// ICEPreConnectDelay pauses inside Connect between adding remote
-	// candidates and calling Accept. Helps slow SFU edges register our
-	// ufrag/pwd before the first STUN binding goes out. 0 = no delay.
-	ICEPreConnectDelay time.Duration
-	// ICEMaxBindingRequests is retained for API parity but ignored —
-	// pion's default is fine now that ICE role is hardcoded CONTROLLED
-	// and 487 storms are gone.
-	ICEMaxBindingRequests uint16
-	SharedUDPMux          bool
-	// PionTraceAsDebug and LogICECandidates are retained for compat —
-	// they are surfaced by the native logger plumbing where applicable.
+	SharedUDPMux bool
+	// PionTraceAsDebug and LogICECandidates are surfaced by the native
+	// logger plumbing where applicable.
 	PionTraceAsDebug bool
 	LogICECandidates bool
 }
@@ -91,10 +62,6 @@ func NewFactory(opts FactoryOptions) (*Factory, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	netTypes := translateNetworkTypes(opts.NetworkTypes)
-	servers, err := translateICEServers(opts.ICEServers)
-	if err != nil {
-		return nil, err
-	}
 
 	var mux ice.UDPMux
 	if opts.SharedUDPMux {
@@ -107,14 +74,12 @@ func NewFactory(opts FactoryOptions) (*Factory, error) {
 	}
 
 	innerOpts := native.FactoryOptions{
-		Logger:             log,
-		CertPoolSize:       opts.CertPoolSize,
-		NetworkTypes:       netTypes,
-		ICEServers:         servers,
-		InterfaceFilter:    defaultInterfaceFilter,
-		IPFilter:           defaultIPFilter,
-		UDPMux:             mux,
-		ICEPreConnectDelay: opts.ICEPreConnectDelay,
+		Logger:          log,
+		CertPoolSize:    opts.CertPoolSize,
+		NetworkTypes:    netTypes,
+		InterfaceFilter: defaultInterfaceFilter,
+		IPFilter:        defaultIPFilter,
+		UDPMux:          mux,
 	}
 	inner, err := native.NewFactory(innerOpts)
 	if err != nil {
@@ -183,31 +148,6 @@ func translateNetworkTypes(in []NetworkType) []ice.NetworkType {
 		out = append(out, ice.NetworkType(n))
 	}
 	return out
-}
-
-// translateICEServers converts the legacy ICEServer slice into the
-// pion/stun URI slice native.Factory expects.
-func translateICEServers(servers []ICEServer) ([]*stun.URI, error) {
-	if len(servers) == 0 {
-		return nil, nil
-	}
-	var out []*stun.URI
-	for _, srv := range servers {
-		for _, raw := range srv.URLs {
-			u, err := stun.ParseURI(raw)
-			if err != nil {
-				return nil, err
-			}
-			if srv.Username != "" {
-				u.Username = srv.Username
-			}
-			if srv.Credential != "" {
-				u.Password = srv.Credential
-			}
-			out = append(out, u)
-		}
-	}
-	return out, nil
 }
 
 // defaultInterfaceFilter skips virtual / VPN / container interfaces

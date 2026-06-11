@@ -459,16 +459,11 @@ gotgcall.New(
     gotgcall.WithSharedUDPMux(),                        // one UDP socket for all calls
     gotgcall.WithDTLSCertPool(16),                      // pre-generate N DTLS certs
     gotgcall.WithDispatchBuffer(512),                   // event-dispatcher queue size
-    gotgcall.WithICEServers([]gotgcall.ICEServer{       // optional TURN (no STUN needed by default)
-        {URLs: []string{"turn:turn.example.com:3478"},
-         Username: "u", Credential: "p"},
-    }),
     gotgcall.WithNetworkTypes(                          // enable IPv6/TCP for restrictive nets
         gotgcall.NetworkTypeUDP4,
         gotgcall.NetworkTypeUDP6,
         gotgcall.NetworkTypeTCP4,
     ),
-    gotgcall.WithICETimeouts(60*time.Second, 120*time.Second, 5*time.Second),
 )
 ```
 
@@ -481,11 +476,8 @@ gotgcall.New(
 | `WithSharedUDPMux` | off | Multiplex every call through one UDP socket. See [UDP mux scaling](#udp-mux--scaling). |
 | `WithDTLSCertPool` | 8 | Pre-generate N DTLS certs so `CreateCall` doesn't stall during bursts. 0 = disabled. |
 | `WithDispatchBuffer` | 256 | Callback queue size. Raise to absorb bursts of state changes. |
-| `WithICEServers` | (none) | gotgcall ships no default STUN — host candidates work for most deployments. Set this when you need TURN. |
 | `WithNetworkTypes` | UDP4+UDP6 | Override the candidate network-type whitelist. Add TCP for environments where UDP is blocked. |
-| `WithICETimeouts` | 60 s / 120 s / 2 s | `(disconnect, failed, keepalive)`. Pass `0` to keep a default. |
 | `WithConnectTimeout` | 10 s | How long `SetSource` / `Resume` wait for the call to be ready. |
-| `WithICEPreConnectDelay` | 250 ms | Short pause inside `Connect` so the SFU registers credentials before the first packet. Negative value disables. |
 | `WithVerboseConnectionLogs` | off | Debug slog + per-candidate logs. Use when reporting a stuck-in-Connecting bug. |
 
 ### Enabling debug logs
@@ -687,11 +679,11 @@ Scales linearly with live calls; nothing is allocated per-source-switch or per-f
 ## Networking
 
 - **Transport:** UDP4 + UDP6 by default. Override with `WithNetworkTypes(...)` to restrict or add TCP.
-- **STUN / TURN:** none by default — host candidates work for the great majority of deployments. Pass `WithICEServers(...)` if you need TURN for symmetric NAT / blocked UDP.
+- **STUN / TURN:** not exposed — host candidates only, matching ntgcalls. Telegram's edge learns our post-NAT source peer-reflexively as ICE-CONTROLLED, so STUN adds nothing for this flow.
 - **Interface filter:** virtual / VPN interfaces (Docker bridges, WSL, VMware, Tailscale, ZeroTier, OpenVPN, etc.) are skipped automatically. Override is not exposed; report a bug if your interface name is being filtered incorrectly.
 - **UDP mux:** default = one socket per call. Pass `WithSharedUDPMux()` to multiplex all calls through one `udp4:0` socket (recommended once you're above ~1 000 concurrent calls — see [UDP mux & scaling](#udp-mux--scaling)).
 - **Connect gate:** `SetSource` waits up to 10 s for the call to reach Connected before returning `ErrNotConnected`. Override with `WithConnectTimeout(...)`.
-- **ICE timeouts:** 60 s disconnect grace, 120 s before declaring failed, 2 s keepalive. Override with `WithICETimeouts(...)`.
+- **ICE timeouts:** internal — 10 s disconnect grace, 30 s failed, 2 s keepalive. Not user-tunable; matches ntgcalls.
 
 ## Performance tuning
 

@@ -8,15 +8,13 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/pion/ice/v4"
-	"github.com/pion/stun/v3"
 )
 
 // Factory pools the per-call inputs that don't change between Stacks:
-// the DTLS cert pool, the ICE network types / interface filters /
-// servers list, an optional shared UDP mux, and a default connect-delay.
+// the DTLS cert pool, the ICE network types / interface filters, and
+// an optional shared UDP mux.
 //
 // Goroutine budget at the Factory layer: 0. Goroutines are paid by the
 // CertPool refill loop (1 — shared across N calls) and by each Stack
@@ -28,8 +26,6 @@ type Factory struct {
 	interfaceFilter func(name string) bool
 	ipFilter        func(ip net.IP) bool
 	networkTypes    []ice.NetworkType
-	iceServers      []*stun.URI
-	connectDelay    time.Duration
 
 	mu sync.Mutex
 
@@ -42,22 +38,16 @@ type Factory struct {
 	closed bool
 }
 
-// FactoryOptions matches the shape of the legacy wrtc.FactoryOptions so
-// callers migrating from PeerConnection-based wrtc.Factory can drop
-// straight in with the same option-bag fields.
+// FactoryOptions configures Factory construction. STUN/TURN servers
+// and ICE timing knobs are not exposed — ntgcalls doesn't expose them
+// either; host candidates + pion defaults cover every real deployment.
 type FactoryOptions struct {
 	UDPMux          ice.UDPMux
 	Logger          *slog.Logger
 	InterfaceFilter func(name string) bool
 	IPFilter        func(ip net.IP) bool
 	NetworkTypes    []ice.NetworkType
-	ICEServers      []*stun.URI
 	CertPoolSize    int
-	// ICEPreConnectDelay matches the legacy field semantics: 0 means
-	// "no delay" (the native flow doesn't need the band-aid the offerer
-	// path did, but the caller may still want a small breath for slow
-	// SFU edges). Negative values are clamped to 0.
-	ICEPreConnectDelay time.Duration
 }
 
 // NewFactory constructs a Factory and starts its cert-pool refill.
@@ -69,9 +59,6 @@ func NewFactory(opts FactoryOptions) (*Factory, error) {
 	if opts.CertPoolSize == 0 {
 		opts.CertPoolSize = 8
 	}
-	if opts.ICEPreConnectDelay < 0 {
-		opts.ICEPreConnectDelay = 0
-	}
 	networkTypes := opts.NetworkTypes
 	if len(networkTypes) == 0 {
 		networkTypes = []ice.NetworkType{ice.NetworkTypeUDP4, ice.NetworkTypeUDP6}
@@ -80,11 +67,9 @@ func NewFactory(opts FactoryOptions) (*Factory, error) {
 		log:             log,
 		certPool:        NewCertPool(opts.CertPoolSize, log),
 		networkTypes:    networkTypes,
-		iceServers:      opts.ICEServers,
 		interfaceFilter: opts.InterfaceFilter,
 		ipFilter:        opts.IPFilter,
 		udpMux:          opts.UDPMux,
-		connectDelay:    opts.ICEPreConnectDelay,
 	}
 	// Seed the SSRC counter randomly so a process restart doesn't collide
 	// with the previous run's calls if Telegram still has them cached.
@@ -125,11 +110,9 @@ func (f *Factory) NewStack(ctx context.Context, withVideo bool) (*Stack, error) 
 		Logger:          f.log,
 		Cert:            cert,
 		NetworkTypes:    f.networkTypes,
-		ICEServers:      f.iceServers,
 		UDPMux:          f.udpMux,
 		InterfaceFilter: f.interfaceFilter,
 		IPFilter:        f.ipFilter,
-		ConnectDelay:    f.connectDelay,
 		AudioSSRC:       audioSSRC,
 		VideoSSRC:       videoSSRC,
 	})

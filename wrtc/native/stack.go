@@ -16,7 +16,6 @@ import (
 	"github.com/pion/ice/v4"
 	"github.com/pion/rtp"
 	"github.com/pion/srtp/v3"
-	"github.com/pion/stun/v3"
 
 	"github.com/annihilatorrrr/gotgcall/models"
 	"github.com/annihilatorrrr/gotgcall/wrtc/jsonparams"
@@ -67,12 +66,6 @@ type Stack struct {
 	// shared between audio + video writes under srtpWriteMu.
 	encryptBuf []byte
 
-	// connectDelay matches the factory option of the same name — a short
-	// sleep between the JoinGroupCall response landing and ICE Accept,
-	// giving Telegram's SFU time to register our ufrag/pwd so the first
-	// inbound STUN binding from us isn't rejected as auth-fail.
-	connectDelay time.Duration
-
 	onStateChangeMu sync.RWMutex
 
 	closeOnce sync.Once
@@ -90,9 +83,9 @@ type Stack struct {
 	closed atomic.Bool
 }
 
-// Options collects construction-time inputs for a Stack. NetworkTypes,
-// ICEServers, and the cert pool are factory-shared; the per-call SSRCs
-// and connect-delay are caller-specified.
+// Options collects construction-time inputs for a Stack. NetworkTypes
+// and the cert pool are factory-shared; the per-call SSRCs are
+// caller-specified. ICE timing and STUN/TURN are handled internally.
 type Options struct {
 	UDPMux          ice.UDPMux
 	Logger          *slog.Logger
@@ -100,8 +93,6 @@ type Options struct {
 	InterfaceFilter func(name string) bool
 	IPFilter        func(ip net.IP) bool
 	NetworkTypes    []ice.NetworkType
-	ICEServers      []*stun.URI
-	ConnectDelay    time.Duration
 
 	AudioSSRC uint32
 	VideoSSRC uint32
@@ -130,9 +121,6 @@ func NewStack(opts Options) (*Stack, error) {
 		agentOpts = append(agentOpts, ice.WithNetworkTypes([]ice.NetworkType{
 			ice.NetworkTypeUDP4, ice.NetworkTypeUDP6,
 		}))
-	}
-	if len(opts.ICEServers) > 0 {
-		agentOpts = append(agentOpts, ice.WithUrls(opts.ICEServers))
 	}
 	if opts.UDPMux != nil {
 		agentOpts = append(agentOpts, ice.WithUDPMux(opts.UDPMux))
@@ -177,17 +165,16 @@ func NewStack(opts Options) (*Stack, error) {
 	}
 
 	s := &Stack{
-		log:          log.With(slog.String("comp", "native")),
-		cert:         opts.Cert,
-		ufrag:        ufrag,
-		pwd:          pwd,
-		audioSSRC:    opts.AudioSSRC,
-		videoSSRC:    opts.VideoSSRC,
-		audio:        audioTrack,
-		video:        videoTrack,
-		agent:        agent,
-		connectDelay: opts.ConnectDelay,
-		encryptBuf:   make([]byte, 0, 1500),
+		log:        log.With(slog.String("comp", "native")),
+		cert:       opts.Cert,
+		ufrag:      ufrag,
+		pwd:        pwd,
+		audioSSRC:  opts.AudioSSRC,
+		videoSSRC:  opts.VideoSSRC,
+		audio:      audioTrack,
+		video:      videoTrack,
+		agent:      agent,
+		encryptBuf: make([]byte, 0, 1500),
 	}
 	s.state.Store(int32(models.Connecting))
 
@@ -264,15 +251,6 @@ func (s *Stack) Connect(ctx context.Context, remoteJSON string) error {
 		}
 		if addErr = s.agent.AddRemoteCandidate(cand); addErr != nil {
 			s.log.Warn("AddRemoteCandidate failed", slog.Int("i", i), slog.Any("err", addErr))
-		}
-	}
-
-	if s.connectDelay > 0 {
-		s.log.Debug("Connect: pre-Accept delay", slog.Duration("delay", s.connectDelay))
-		select {
-		case <-time.After(s.connectDelay):
-		case <-ctx.Done():
-			return ctx.Err()
 		}
 	}
 
