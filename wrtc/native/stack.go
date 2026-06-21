@@ -242,9 +242,9 @@ func (s *Stack) Connect(ctx context.Context, remoteJSON string) error {
 	rp, err := parseRemoteJSON(remoteJSON)
 	if err != nil {
 		if errors.Is(err, jsonparams.ErrUnsupportedMode) {
-			return fmt.Errorf("%w: %v", models.ErrUnsupportedCallMode, err)
+			return fmt.Errorf("%w: %w", models.ErrUnsupportedCallMode, err)
 		}
-		return fmt.Errorf("%w: %v", models.ErrInvalidParams, err)
+		return fmt.Errorf("%w: %w", models.ErrInvalidParams, err)
 	}
 
 	for i, c := range rp.candidates {

@@ -395,15 +395,12 @@ func (s *MultiShellSource) openParallel(ctx context.Context, audioArgs, videoArg
 		audioR, videoR     *gtio.ShellReader
 		audioErr, videoErr error
 	)
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		audioR, audioErr = s.spawnLeg(ctx, s.audioBin, audioArgs)
-	}()
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		videoR, videoErr = s.spawnLeg(ctx, s.videoBin, videoArgs)
-	}()
+	})
 	wg.Wait()
 
 	if audioErr != nil {

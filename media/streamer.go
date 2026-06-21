@@ -45,7 +45,7 @@ type Streamer struct {
 	resume chan struct{}
 
 	onEnd  func(err error)
-	msSent atomic.Uint64
+	nsSent atomic.Uint64
 
 	once sync.Once
 
@@ -126,16 +126,14 @@ func (s *Streamer) run() {
 			s.log.Error("streamer: panic", slog.Any("recover", r))
 			s.fireEnd(panicErr{v: r})
 		}
-		s.log.Debug("streamer: run exit", slog.Uint64("msSent", s.msSent.Load()))
+		s.log.Debug("streamer: run exit", slog.Uint64("nsSent", s.nsSent.Load()))
 	}()
 	s.log.Debug("streamer: run start")
 
-	// One timer for the entire loop — reset each iteration. Go 1.23+
-	// Reset semantics make this safe without manual drain.
+	// One timer for the entire loop — Reset each iteration. Go 1.23+
+	// semantics: Reset cancels any pending fire and clears the channel,
+	// so no manual drain or initial Stop is needed.
 	t := time.NewTimer(0)
-	if !t.Stop() {
-		<-t.C
-	}
 	defer t.Stop()
 
 	next := time.Now()
@@ -161,7 +159,7 @@ func (s *Streamer) run() {
 		sample, err := s.src.Next(s.ctx)
 		stallTimer.Stop()
 		if err != nil {
-			s.log.Debug("streamer: src.Next err", slog.Any("err", err), slog.Uint64("msSent", s.msSent.Load()))
+			s.log.Debug("streamer: src.Next err", slog.Any("err", err), slog.Uint64("nsSent", s.nsSent.Load()))
 			s.fireEnd(err)
 			return
 		}
@@ -172,24 +170,18 @@ func (s *Streamer) run() {
 				return
 			}
 		}
-		s.msSent.Add(uint64(sample.Duration / time.Millisecond))
+		s.nsSent.Add(uint64(sample.Duration))
 
 		next = next.Add(sample.Duration)
 		wait := time.Until(next)
-		if wait < -100*time.Millisecond {
-			next = time.Now()
-			continue
-		}
 		if wait <= 0 {
+			next = time.Now()
 			continue
 		}
 		t.Reset(wait)
 		select {
 		case <-t.C:
 		case <-s.ctx.Done():
-			if !t.Stop() {
-				<-t.C
-			}
 			s.fireEnd(s.ctx.Err())
 			return
 		}
@@ -223,7 +215,9 @@ func (s *Streamer) SetMuted(m bool) { s.muted.Store(m) }
 func (s *Streamer) Muted() bool     { return s.muted.Load() }
 
 // ElapsedMs returns cumulative ms of samples handed to the pacing loop.
-func (s *Streamer) ElapsedMs() uint64 { return s.msSent.Load() }
+// Tracked in nanoseconds internally and floored to ms so the value
+// stays accurate at non-integer-ms frame rates (e.g. VP8 60fps = 16.666 ms).
+func (s *Streamer) ElapsedMs() uint64 { return s.nsSent.Load() / uint64(time.Millisecond) }
 
 type panicErr struct{ v any }
 

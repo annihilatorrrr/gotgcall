@@ -18,10 +18,10 @@ package models
 //     downstream MTProto callers can flip presentation_paused
 //     uniformly with the other flags.
 type MediaState struct {
-	Muted              bool
-	Paused             bool
-	VideoStopped       bool
-	PresentationPaused bool
+	Muted              bool `json:"muted,omitzero"`
+	Paused             bool `json:"paused,omitzero"`
+	VideoStopped       bool `json:"video_stopped,omitzero"`
+	PresentationPaused bool `json:"presentation_paused,omitzero"`
 }
 
 type ConnState int
@@ -52,9 +52,9 @@ func (s ConnState) String() string {
 }
 
 type NetworkInfo struct {
-	State ConnState
+	State ConnState `json:"state"`
 }
 
 type CallInfo struct {
-	CaptureTimeMs uint64
+	CaptureTimeMs uint64 `json:"capture_time_ms"`
 }
