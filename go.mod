@@ -7,7 +7,7 @@ require (
 	github.com/pion/ice/v4 v4.3.0
 	github.com/pion/rtp v1.10.5
 	github.com/pion/srtp/v3 v3.0.12
-	github.com/pion/webrtc/v4 v4.2.16
+	github.com/pion/webrtc/v4 v4.2.17
 )
 
 require (
