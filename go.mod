@@ -6,7 +6,7 @@ require (
 	github.com/pion/dtls/v3 v3.1.5
 	github.com/pion/ice/v4 v4.4.0
 	github.com/pion/rtp v1.10.5
-	github.com/pion/srtp/v3 v3.0.12
+	github.com/pion/srtp/v3 v3.0.13
 	github.com/pion/webrtc/v4 v4.2.18
 )
 
