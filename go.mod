@@ -7,7 +7,7 @@ require (
 	github.com/pion/ice/v4 v4.4.1
 	github.com/pion/rtp v1.10.5
 	github.com/pion/srtp/v3 v3.0.13
-	github.com/pion/webrtc/v4 v4.2.18
+	github.com/pion/webrtc/v4 v4.2.19
 )
 
 require (
@@ -18,7 +18,7 @@ require (
 	github.com/pion/rtcp v1.2.17 // indirect
 	github.com/pion/stun/v3 v3.1.7 // indirect
 	github.com/pion/transport/v4 v4.1.0 // indirect
-	github.com/pion/turn/v5 v5.0.12 // indirect
+	github.com/pion/turn/v5 v5.0.13 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
