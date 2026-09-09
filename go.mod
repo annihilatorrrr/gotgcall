@@ -3,7 +3,7 @@ module github.com/annihilatorrrr/gotgcall
 go 1.26.4
 
 require (
-	github.com/pion/dtls/v3 v3.1.5
+	github.com/pion/dtls/v3 v3.1.8
 	github.com/pion/ice/v4 v4.4.1
 	github.com/pion/rtp v1.10.5
 	github.com/pion/srtp/v3 v3.0.13
