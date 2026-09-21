@@ -6,7 +6,7 @@ require (
 	github.com/pion/dtls/v3 v3.1.9
 	github.com/pion/ice/v4 v4.4.3
 	github.com/pion/rtp v1.10.5
-	github.com/pion/srtp/v3 v3.0.15
+	github.com/pion/srtp/v3 v3.0.16
 	github.com/pion/webrtc/v4 v4.2.20
 )
 
@@ -17,7 +17,6 @@ require (
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/rtcp v1.2.17 // indirect
 	github.com/pion/stun/v4 v4.0.1 // indirect
-	github.com/pion/transport/v4 v4.1.1 // indirect
 	github.com/pion/transport/v5 v5.0.0 // indirect
 	github.com/pion/turn/v5 v5.1.2 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
