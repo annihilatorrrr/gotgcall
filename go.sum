@@ -1,7 +1,7 @@
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-github.com/pion/dtls/v3 v3.1.9 h1:rpeycmLIkc4krpk1IxP7+39o11QdCXbmV9+FGi9yZJ8=
-github.com/pion/dtls/v3 v3.1.9/go.mod h1:iKFQNYrjsN2TiA2YKKMqB9MOZaFpjFULBI/A4sW0eyc=
+github.com/pion/dtls/v3 v3.1.10 h1:HWC+QCZitP/ApADS/6+g7UIw2YmLgoK3CsynnjPJgMo=
+github.com/pion/dtls/v3 v3.1.10/go.mod h1:iKFQNYrjsN2TiA2YKKMqB9MOZaFpjFULBI/A4sW0eyc=
 github.com/pion/ice/v4 v4.4.3 h1:N6QvfvZTQ1s7TBc9k/oiDCqQVWNNw+DVxYtmlrXjQg4=
 github.com/pion/ice/v4 v4.4.3/go.mod h1:Os0162PHZie7X19S0ym6E7/bK82pErGfLn6yoUrKIV0=
 github.com/pion/logging v0.2.4 h1:tTew+7cmQ+Mc1pTBLKH2puKsOvhm32dROumOZ655zB8=
