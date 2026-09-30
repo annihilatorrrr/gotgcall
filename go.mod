@@ -4,10 +4,10 @@ go 1.26.4
 
 require (
 	github.com/pion/dtls/v3 v3.1.10
-	github.com/pion/ice/v4 v4.4.3
+	github.com/pion/ice/v4 v4.4.4
 	github.com/pion/rtp v1.10.5
 	github.com/pion/srtp/v3 v3.1.0
-	github.com/pion/webrtc/v4 v4.2.20
+	github.com/pion/webrtc/v4 v4.2.22
 )
 
 require (
@@ -17,7 +17,7 @@ require (
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/rtcp v1.2.18 // indirect
 	github.com/pion/stun/v4 v4.0.1 // indirect
-	github.com/pion/transport/v5 v5.1.0 // indirect
+	github.com/pion/transport/v5 v5.1.1 // indirect
 	github.com/pion/turn/v5 v5.1.2 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
