@@ -1,6 +1,6 @@
 module github.com/annihilatorrrr/gotgcall
 
-go 1.27.1
+go 1.26.0
 
 require (
 	github.com/pion/dtls/v3 v3.1.14
