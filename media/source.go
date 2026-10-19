@@ -116,6 +116,9 @@ func SetFFmpegPath(p string) {
 	ffmpegBinary.Store(p)
 }
 
+// FFmpegPath returns the ffmpeg binary configured via SetFFmpegPath.
+func FFmpegPath() string { return ffmpegPath() }
+
 func ffmpegPath() string {
 	if v := ffmpegBinary.Load(); v != nil {
 		return v.(string)

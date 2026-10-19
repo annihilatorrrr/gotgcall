@@ -32,7 +32,13 @@ func newOpusFrameReader(r stdio.Reader) (frameReader, error) {
 	br := bufio.NewReaderSize(r, 8192)
 	// pion validates the OpusHead page. It reads exactly one page, so br
 	// is left aligned on the next page for nextPage.
-	if _, _, err := oggreader.NewWith(br); err != nil {
+	_, head, err := oggreader.NewWith(br)
+	if err == nil && head.ChannelMap != 0 && head.StreamCount > 1 {
+		// Multistream (surround) packets aren't plain Opus to the SFU;
+		// a -c:a copy of such a source would play as garbage.
+		err = fmt.Errorf("multistream opus (%d streams) is not supported", head.StreamCount)
+	}
+	if err != nil {
 		if c, ok := r.(stdio.Closer); ok {
 			_ = c.Close()
 		}
@@ -129,6 +135,9 @@ func (o *opusFrameReader) nextPacket() ([]byte, error) {
 		case orphan:
 			orphan = !done
 		case !done:
+			if len(o.carry)+n > maxOggPacket {
+				return nil, fmt.Errorf("%w: ogg packet over %d bytes", models.ErrFile, maxOggPacket)
+			}
 			o.carry = append(o.carry, chunk...)
 			partial = true
 		case partial:
@@ -216,6 +225,10 @@ func opusPacketDuration(p []byte) time.Duration {
 
 var errOggChecksum = errors.New("expected and actual checksum do not match")
 
+// maxOggPacket caps a packet assembled across pages. OpusTags with cover
+// art can run to a few MB; anything larger is a broken stream.
+const maxOggPacket = 16 << 20
+
 // oggCRCTable is the Ogg CRC-32 (poly 0x04c11db7, unreflected, so
 // hash/crc32 can't be used), built once per process.
 var oggCRCTable = func() (t [256]uint32) {
@@ -288,7 +301,9 @@ func (v *vp8FrameReader) Close() error {
 }
 
 // NewOpusFrameReader exposes the internal opus reader for callers that
-// have a raw ogg byte stream (e.g. instances/group_call).
+// have a raw ogg byte stream (e.g. instances/group_call). A returned
+// Sample's Data aliases the reader's buffers and is only valid until the
+// next Next call; copy it to keep it longer.
 func NewOpusFrameReader(r stdio.Reader) (FrameReader, error) {
 	fr, err := newOpusFrameReader(r)
 	return fr, err

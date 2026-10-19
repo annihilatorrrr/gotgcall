@@ -428,7 +428,7 @@ gotgcall.FromShells(
 - **Quoting.** Use double quotes for arguments with spaces; `\"` for a literal `"` inside; `\\` for a literal `\`. Single quotes are not quote characters — they're literal apostrophes (filenames like `Don't Stop.mp3` work as-is, no quoting needed unless there's a space).
 - **HLS/HTTP convenience flags don't apply.** `FromFile`/`FromURL` inject `-user_agent`, `-reconnect *`, `-protocol_whitelist`, `-rw_timeout` automatically; `FromShell` does not. Add them yourself when streaming m3u8 / unreliable HTTP.
 - **Hardware encoders rarely help.** Telegram only accepts VP8, and very few platforms have a VP8 hardware encoder (some Intel iGPUs have `vp8_vaapi`; most NVENC/QSV builds don't). Stick with `libvpx`.
-- **`-c:a copy` works for Opus sources only.** When the input is already Opus (e.g. YouTube's `audio/webm` formats), `-c:a copy` skips decode and re-encode entirely: only `-page_duration` and `-f ogg` are auto-filled, and the reader times each packet from its TOC byte, so any Opus frame size paces correctly. Any other input codec fails the OpusHead check with `ErrFile`, which reaps the call, so only copy when you know the codec. `-c:v copy` stays brittle: pacing depends on the IVF keyframe cadence.
+- **`-c:a copy` works for Opus sources only.** When the input is already Opus (e.g. YouTube itags 249/250/251; note `audio/webm` itags 171/172 are Vorbis), `-c:a copy` skips decode and re-encode entirely: only `-page_duration` and `-f ogg` are auto-filled, and the reader times each packet from its TOC byte, so any Opus frame size paces correctly. Any other input codec fails the OpusHead check with `ErrFile`, which reaps the call, so only copy when you know the codec. `-c:v copy` stays brittle: pacing depends on the IVF keyframe cadence.
 - **Auto-fill is per-flag, not all-or-nothing.** Each flag is checked independently — `-c:a libopus -b:a 192k` keeps your bitrate and still fills in `-application`, `-frame_duration`, `-page_duration`, `-mapping_family`, `-ar`, `-ac`, `-f` (with `-c:a copy` only `-page_duration` and `-f`). The only setting that gets *rejected* is a raw PCM/YUV output codec, with an error pointing at the right replacement.
 - **Inspecting the realized argv.** gotgcall doesn't currently log the post-injection argv. Turn on `WithFFmpegStderrLog()` and you'll see ffmpeg's own "Input #0 …" / "Stream mapping" output, which confirms what it parsed and which streams it picked.
 
@@ -458,7 +458,7 @@ gotgcall.New(
     gotgcall.WithFFmpegStderrLog(),                     // tee ffmpeg stderr → debug log
     gotgcall.WithSharedUDPMux(),                        // one UDP socket for all calls
     gotgcall.WithDTLSCertPool(16),                      // pre-generate N DTLS certs
-    gotgcall.WithDispatchBuffer(512),                   // event-dispatcher queue size
+    gotgcall.WithDispatchBuffer(512),                   // event-dispatcher initial queue capacity
     gotgcall.WithNetworkTypes(                          // enable IPv6/TCP for restrictive nets
         gotgcall.NetworkTypeUDP4,
         gotgcall.NetworkTypeUDP6,
@@ -475,7 +475,7 @@ gotgcall.New(
 | `WithFFmpegStderrLog` | off | Tees ffmpeg stderr line-by-line into the logger. Helpful for "stream runs but I hear nothing" diagnostics. |
 | `WithSharedUDPMux` | off | Multiplex every call through one UDP socket. See [UDP mux scaling](#udp-mux--scaling). |
 | `WithDTLSCertPool` | 8 | Pre-generate N DTLS certs so `CreateCall` doesn't stall during bursts. 0 = disabled. |
-| `WithDispatchBuffer` | 256 | Callback queue size. Raise to absorb bursts of state changes. |
+| `WithDispatchBuffer` | 256 | Initial callback-queue capacity. The queue grows as needed; events are never dropped. |
 | `WithNetworkTypes` | UDP4+UDP6 | Override the candidate network-type whitelist. Add TCP for environments where UDP is blocked. |
 | `WithConnectTimeout` | 10 s | How long `SetSource` / `Resume` wait for the call to be ready. |
 | `WithVerboseConnectionLogs` | off | Debug slog + per-candidate logs. Use when reporting a stuck-in-Connecting bug. |
@@ -615,7 +615,7 @@ client.OnUpgrade(func(chat int64, state MediaState) {
 
 All callbacks fire on a single dispatcher goroutine, so you can safely re-enter the API from inside (e.g. call `client.Stop(chat)` from inside `OnStreamEnd`). If your callback panics it is recovered and logged; the dispatcher keeps running.
 
-If the dispatch queue fills up (slow consumer), the dispatcher drops the **oldest** queued event and logs a warning. Tune with `WithDispatchBuffer`.
+The dispatch queue is unbounded: a slow callback delays later events but never loses them (a dropped `OnStreamEnd` would leave a chat silent). Keep callbacks quick and move slow work (MTProto calls, `SetStreamSources`) to a goroutine so other calls' events aren't held up.
 
 ## Server-side media-state changes (admin mute, video off)
 
@@ -671,7 +671,7 @@ Deliberately frugal:
 
 - **3 shared per process** — keepalive ticker, callback dispatcher, DTLS cert pool refill.
 - **3 per live call** — audio streamer, video streamer, and one inbound drainer.
-- **1 per ffmpeg subprocess** — waits for the process to exit and surfaces the error.
+- **3 per ffmpeg subprocess** — ours waits for the process to exit and surfaces the error; `os/exec` adds a stderr copier and a context watcher.
 - pion adds ~5–8 of its own per call (ICE/DTLS/SRTP internals) — upstream territory.
 
 Scales linearly with live calls; nothing is allocated per-source-switch or per-frame.
@@ -688,7 +688,7 @@ Scales linearly with live calls; nothing is allocated per-source-switch or per-f
 ## Performance tuning
 
 - **Cert pool** (`WithDTLSCertPool`): default 8; raise for very bursty workloads so `CreateCall` doesn't block on keygen.
-- **Dispatch buffer** (`WithDispatchBuffer`): default 256. Raise if you see drop warnings under bursty callback fan-out.
+- **Dispatch buffer** (`WithDispatchBuffer`): default 256, the queue's initial capacity. It grows on bursts; raising it only avoids early reallocations.
 - **Shared UDP mux** (`WithSharedUDPMux`): cuts FD use once you're above ~1 000 concurrent calls.
 - **Fast cold-start:** `FromFile` / `FromURL` already inject `-analyzeduration 0 -probesize 64k` to cut ~1–2 s from ffmpeg startup. Add the same flags in your `FromShell` commands if cold-start matters.
 

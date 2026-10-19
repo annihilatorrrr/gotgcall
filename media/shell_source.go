@@ -147,13 +147,14 @@ func ensureFFmpegFlags(args []string, track Track) []string {
 	return out
 }
 
-// copiesAudio reports whether the last audio codec option in argv is
-// "copy" (-c, -codec, -c:a, -codec:a or -acodec).
+// copiesAudio reports whether the last audio codec option in argv
+// (-c:a, -codec:a or -acodec) is "copy". An all-streams "-c copy" does
+// not count: the injected "-c:a libopus" overrides it for audio.
 func copiesAudio(args []string) bool {
 	cp := false
 	for i := 0; i+1 < len(args); i++ {
 		switch args[i] {
-		case "-c", "-codec", "-c:a", "-codec:a", "-acodec":
+		case "-c:a", "-codec:a", "-acodec":
 			cp = args[i+1] == "copy"
 		}
 	}

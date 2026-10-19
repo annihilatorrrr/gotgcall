@@ -13,7 +13,8 @@ import (
 )
 
 // Writer consumes encoded samples. Implemented by pion's TrackLocalStaticSample
-// and by test fakes.
+// and by test fakes. Sample.Data is only valid until the reader's next
+// Next call: a Writer that keeps it past WriteSample must copy it.
 type Writer interface {
 	WriteSample(s media.Sample) error
 }
@@ -93,11 +94,11 @@ func (s *Streamer) SetPaused(p bool) {
 // IsPaused reports whether the gate is currently blocking the loop.
 func (s *Streamer) IsPaused() bool { return s.pausedGate.Load() }
 
-// gate blocks while paused. Returns false if the context is canceled while
-// waiting, so the loop can exit cleanly.
-func (s *Streamer) gate() bool {
+// gate blocks while paused. ok is false if the context is canceled, so
+// the loop can exit cleanly; waited reports whether it actually blocked.
+func (s *Streamer) gate() (ok, waited bool) {
 	if !s.pausedGate.Load() {
-		return s.ctx.Err() == nil
+		return s.ctx.Err() == nil, false
 	}
 	// Drop any stale resume token left from a previous cycle.
 	select {
@@ -108,10 +109,10 @@ func (s *Streamer) gate() bool {
 		select {
 		case <-s.resume:
 		case <-s.ctx.Done():
-			return false
+			return false, true
 		}
 	}
-	return s.ctx.Err() == nil
+	return s.ctx.Err() == nil, true
 }
 
 // Start kicks off the pacing goroutine. Returns immediately. The run loop
@@ -148,12 +149,15 @@ func (s *Streamer) run() {
 			s.fireEnd(err)
 			return
 		}
-		if !s.gate() {
+		ok, waited := s.gate()
+		if !ok {
 			s.fireEnd(s.ctx.Err())
 			return
 		}
-		if gateWake := time.Now(); gateWake.After(next) {
-			next = gateWake
+		// Only a pause restarts the clock. Resetting on every pass would
+		// throw away each timer's lateness and play slower than real time.
+		if waited {
+			next = time.Now()
 		}
 		stallTimer.Reset(stallTimeout)
 		sample, err := s.src.Next(s.ctx)

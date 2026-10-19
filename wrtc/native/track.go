@@ -36,12 +36,13 @@ const (
 //   - writeStream is published once (Connect → AttachWriteStream) and
 //     thereafter read-only from many goroutines. Stored in an
 //     atomic.Pointer so the hot path reads it lock-free.
-//   - writeMu serialises writePackets calls within a single Track so
-//     the streamer goroutine and the keepalive goroutine cannot mutate
-//     absSendBuf / extBuf concurrently (SetExtension stores the slice by
+//   - writeMu covers packetise + write within a single Track, so the
+//     streamer goroutine and the keepalive goroutine (GeneratePadding)
+//     never mutate the packetizer's sequence/timestamp state or
+//     absSendBuf / extBuf concurrently, and padding never lands between
+//     the packets of one frame (SetExtension stores the slice by
 //     reference; pion/rtp marshals it during the subsequent SRTP write,
-//     and EncryptRTP re-parses the header back into extBuf, so both are
-//     in-flight until WriteRTP returns).
+//     so both are in-flight until WriteRTP returns).
 //   - The mutex is per-Track. Audio and video Tracks have independent
 //     mutexes; the shared SRTP context further down still serializes
 //     encryption across both via Stack.srtpWriteMu.
@@ -118,37 +119,34 @@ func (t *Track) SSRC() uint32 { return t.ssrc }
 
 // WriteSample packetises and sends one encoded frame.
 func (t *Track) WriteSample(s media.Sample) error {
-	// Integer math: the float form truncates e.g. 60 ms to 2879 ticks.
-	samples := uint32(s.Duration * time.Duration(t.clockRate) / time.Second)
-	pkts := t.packetizer.Packetize(s.Data, samples)
-	if len(pkts) == 0 {
-		return nil
-	}
-	return t.writePackets(pkts)
+	// Round to nearest: VP8's time.Second/fps frames (33333333 ns) are
+	// 3000 ticks, not 2999; Opus frame lengths stay exact.
+	samples := uint32((s.Duration*time.Duration(t.clockRate) + time.Second/2) / time.Second)
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	return t.writePacketsLocked(t.packetizer.Packetize(s.Data, samples))
 }
 
 // GeneratePadding emits N RTP padding packets — used by the keepalive
 // loop to keep Telegram's SFU video SSRC binding warm. No payload is
 // generated; the SFU strips the padding before forwarding.
 func (t *Track) GeneratePadding(count uint32) error {
-	pkts := t.packetizer.GeneratePadding(count)
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	return t.writePacketsLocked(t.packetizer.GeneratePadding(count))
+}
+
+func (t *Track) writePacketsLocked(pkts []*rtp.Packet) error {
 	if len(pkts) == 0 {
 		return nil
 	}
-	return t.writePackets(pkts)
-}
-
-func (t *Track) writePackets(pkts []*rtp.Packet) error {
 	slot := t.writeStream.Load()
 	if slot == nil {
 		return nil
 	}
 	ws := slot.w
 
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-
-	// Compute abs-send-time once per writePackets call: every packet from
+	// Compute abs-send-time once per call: every packet from
 	// a single sample shares the same send instant within the resolution
 	// we care about. Reusing one 3-byte buffer across packets within the
 	// mutex avoids per-packet heap traffic; pion/rtp marshals the slice

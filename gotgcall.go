@@ -155,7 +155,8 @@ func WithDTLSCertPool(n int) Option {
 	return func(c *config) { c.certPoolSize = n }
 }
 
-// WithDispatchBuffer sizes the event dispatcher's channel. Default 256.
+// WithDispatchBuffer sets the event dispatcher's initial queue capacity.
+// Default 256. The queue grows as needed; events are never dropped.
 func WithDispatchBuffer(n int) Option {
 	return func(c *config) {
 		if n > 0 {
@@ -279,19 +280,19 @@ type Client struct {
 	onConnectionChange func(chatID int64, info NetworkInfo)
 	onUpgrade          func(chatID int64, state MediaState)
 	calls              sync.Map // map[int64]instances.Call
-	createMu           sync.Map // map[int64]*sync.Mutex — gates CreateCall/StartRTMP per chat
 	cfg                config
 	cbMu               sync.RWMutex
 	closed             atomic.Bool
+	// createMu gates CreateCall/StartRTMP per chat. Striped by chatID so
+	// memory stays fixed however many chats a process ever sees; two
+	// chats sharing a stripe only serialise their (millisecond) creates.
+	createMu [256]sync.Mutex
 }
 
 // acquireCreate serialises the construction phase of CreateCall and
-// StartRTMP for a single chat. Returns the unlock function. The per-chat
-// mutex is kept in the map for the lifetime of the process (sizeof
-// sync.Mutex per unique chatID ever started — negligible).
+// StartRTMP for a single chat. Returns the unlock function.
 func (c *Client) acquireCreate(chatID int64) func() {
-	v, _ := c.createMu.LoadOrStore(chatID, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
+	mu := &c.createMu[uint64(chatID)%uint64(len(c.createMu))]
 	mu.Lock()
 	return mu.Unlock
 }
@@ -372,7 +373,7 @@ func (c *Client) CreateCall(chatID int64) (string, error) {
 	c.calls.Store(chatID, instances.Call(gc))
 	params, err := gc.CreateLocalParams()
 	if err != nil {
-		c.reap(chatID)
+		c.reap(chatID, gc)
 		return "", err
 	}
 	return params, nil
@@ -387,7 +388,7 @@ func (c *Client) Connect(chatID int64, telegramParams string) error {
 		return err
 	}
 	if err = call.Connect(telegramParams); err != nil {
-		c.reap(chatID)
+		c.reap(chatID, call)
 		return err
 	}
 	return nil
@@ -425,29 +426,23 @@ func (c *Client) callIsLive(chatID int64) bool {
 	}
 	prev := v.(instances.Call)
 	if state := prev.NetState(); state == models.Failed || state == models.Closed {
-		c.calls.Delete(chatID)
+		c.calls.CompareAndDelete(chatID, prev)
 		_ = prev.Stop()
 		return false
 	}
 	return true
 }
 
-// reap removes the per-chat call entry and tears it down. Used by every
+// reap removes call from the registry and tears it down. Used by every
 // setup-phase API (CreateCall, Connect, SetStreamSources) when the call
 // returns an error so the caller doesn't need to remember to invoke Stop
-// separately. Safe if the entry is already gone (e.g. concurrent Stop).
-//
-// Intentionally does NOT touch createMu: a concurrent goroutine may be
-// parked on mu.Lock() from acquireCreate having already resolved the
-// pointer. Deleting the map entry would let the next acquireCreate
-// LoadOrStore a fresh mutex, and the two goroutines would then hold
-// different mutexes for the same chat and race inside CreateCall.
-func (c *Client) reap(chatID int64) {
-	v, ok := c.calls.LoadAndDelete(chatID)
-	if !ok {
-		return
-	}
-	_ = v.(instances.Call).Stop()
+// separately. Only the failed call itself is removed: if a newer call
+// already replaced it for chatID (e.g. a Failed → re-CreateCall racing a
+// late SetStreamSources error on the old one), the newer call is left
+// untouched.
+func (c *Client) reap(chatID int64, call instances.Call) {
+	c.calls.CompareAndDelete(chatID, call)
+	_ = call.Stop()
 }
 
 // --- Lifecycle: source control --------------------------------------------------
@@ -467,7 +462,7 @@ func (c *Client) SetStreamSources(chatID int64, src Source) error {
 		return err
 	}
 	if err = call.SetSource(context.Background(), src); err != nil {
-		c.reap(chatID)
+		c.reap(chatID, call)
 		return err
 	}
 	return nil
@@ -524,17 +519,15 @@ func (c *Client) SeekBy(chatID int64, deltaMs int64) error {
 	return call.SeekBy(deltaMs)
 }
 
-// Stop tears down the call and clears the per-chat call entry. The
-// per-chat create-mutex is intentionally kept (see reap) so a concurrent
-// CreateCall parked on mu.Lock() doesn't end up racing a later one on a
-// fresh mutex. The mutex memory is negligible (sizeof sync.Mutex per
-// chatID ever used).
+// Stop tears down the call and clears the per-chat call entry. Only the
+// call looked up here is removed, so a newer call stored for chatID in
+// the meantime is neither deleted nor leaked.
 func (c *Client) Stop(chatID int64) error {
 	call, err := c.lookup(chatID)
 	if err != nil {
 		return err
 	}
-	c.calls.Delete(chatID)
+	c.calls.CompareAndDelete(chatID, call)
 	return call.Stop()
 }
 

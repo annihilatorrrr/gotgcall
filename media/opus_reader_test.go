@@ -8,6 +8,8 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"github.com/annihilatorrrr/gotgcall/models"
 )
 
 func oggPage(flags byte, lacing, body []byte) []byte {
@@ -119,7 +121,7 @@ func TestCopiesAudio(t *testing.T) {
 	}{
 		{[]string{"-i", "x", "-c:a", "copy"}, true},
 		{[]string{"-i", "x", "-acodec", "copy"}, true},
-		{[]string{"-i", "x", "-c", "copy"}, true},
+		{[]string{"-i", "x", "-c", "copy"}, false},
 		{[]string{"-i", "x", "-c", "copy", "-c:a", "libopus"}, false},
 		{[]string{"-i", "x", "-c:a", "libopus"}, false},
 		{[]string{"-i", "copy"}, false},
@@ -135,5 +137,16 @@ func TestCopiesAudio(t *testing.T) {
 				t.Errorf("copy argv got encoder flag %s: %q", f, args)
 			}
 		}
+	}
+}
+
+func TestOpusFrameReaderRejectsMultistream(t *testing.T) {
+	stereo := append([]byte("OpusHead"), 1, 2, 0x38, 1, 0x80, 0xBB, 0, 0, 0, 0, 1, 1, 1, 0, 1)
+	if _, err := newOpusFrameReader(bytes.NewReader(oggPage(0x02, lace(len(stereo)), stereo))); err != nil {
+		t.Fatalf("family 1, one stream: %v", err)
+	}
+	surround := append([]byte("OpusHead"), 1, 6, 0x38, 1, 0x80, 0xBB, 0, 0, 0, 0, 1, 4, 2, 0, 4, 1, 2, 3, 5)
+	if _, err := newOpusFrameReader(bytes.NewReader(oggPage(0x02, lace(len(surround)), surround))); !errors.Is(err, models.ErrFile) {
+		t.Fatalf("5.1 multistream: got %v, want ErrFile", err)
 	}
 }

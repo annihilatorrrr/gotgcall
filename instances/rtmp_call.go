@@ -87,7 +87,7 @@ func (r *RTMPCall) spawnLocked(ctx context.Context, seekMs uint64) error {
 	opt := r.srcPath.EncodeOpts().WithDefaults()
 	args := buildRTMPArgs(r.srcPath, seekMs, opt, r.rtmpURL)
 	ctx, cancel := context.WithCancel(ctx)
-	cmd, err := gtio.NewShellReader(ctx, "ffmpeg", args, r.log, media.StderrLogEnabled())
+	cmd, err := gtio.NewShellReader(ctx, media.FFmpegPath(), args, r.log, media.StderrLogEnabled())
 	if err != nil {
 		cancel()
 		return err
@@ -96,14 +96,26 @@ func (r *RTMPCall) spawnLocked(ctx context.Context, seekMs uint64) error {
 	// goroutine via SetOnExit instead of spawning a separate watchEnd goroutine
 	// per call. Saves one goroutine per active RTMP call.
 	cmd.SetOnExit(func(exitErr error) {
-		if r.closed.Load() {
+		// A canceled spawn context means we killed ffmpeg ourselves
+		// (Pause, SetSource, SeekBy, Stop): that is not a stream end.
+		if r.closed.Load() || ctx.Err() != nil || r.disp == nil {
 			return
 		}
-		if r.disp != nil && r.ev.OnStreamEnd != nil {
-			r.disp.Submit(func() {
+		// r.mu is taken on the dispatcher, never here: SetOnExit runs
+		// this hook synchronously when ffmpeg already exited, and
+		// spawnLocked holds r.mu at that point.
+		r.disp.Submit(func() {
+			r.mu.Lock()
+			current := r.cmd == cmd && ctx.Err() == nil
+			if current {
+				// The source is finished: a later Resume must not replay it.
+				r.src, r.srcPath = nil, nil
+			}
+			r.mu.Unlock()
+			if current && !r.closed.Load() && r.ev.OnStreamEnd != nil {
 				r.ev.OnStreamEnd(models.Audio, models.Microphone, exitErr)
-			})
-		}
+			}
+		})
 	})
 	r.cmd = cmd
 	r.cmdCancel = cancel
@@ -174,10 +186,10 @@ func (r *RTMPCall) notSupportedToggle(flag *bool, target bool) (bool, error) {
 }
 
 // SeekBy shifts playback by deltaMs relative to the current position
-// (positive forward, negative backward). Underflow below 0 force-stops
-// ffmpeg and lets its onExit dispatch OnStreamEnd. Normal seek nils
-// the old ffmpeg's onExit (so its cancel doesn't masquerade as EOF),
-// stops it, advances resumeMs, and respawns at the new offset.
+// (positive forward, negative backward). Underflow below 0 stops ffmpeg
+// and fires OnStreamEnd. Normal seek stops the old ffmpeg (its exit is
+// ignored because we canceled it), advances resumeMs, and respawns at
+// the new offset.
 func (r *RTMPCall) SeekBy(deltaMs int64) error {
 	if r.closed.Load() {
 		return models.ErrClosed
@@ -197,12 +209,17 @@ func (r *RTMPCall) SeekBy(deltaMs int64) error {
 	target := int64(curMs) + deltaMs
 	if target < 0 {
 		r.stopFFmpegLocked()
+		r.src, r.srcPath = nil, nil
 		r.resumeMs = 0
 		r.elapsedMs.Store(0)
+		if r.disp != nil && r.ev.OnStreamEnd != nil {
+			r.disp.Submit(func() {
+				if !r.closed.Load() {
+					r.ev.OnStreamEnd(models.Audio, models.Microphone, nil)
+				}
+			})
+		}
 		return nil
-	}
-	if r.cmd != nil {
-		r.cmd.SetOnExit(nil)
 	}
 	r.stopFFmpegLocked()
 	r.resumeMs = uint64(target)

@@ -42,6 +42,7 @@ type GroupCall struct {
 	streams        *media.Streams
 	audioStr       *media.Streamer
 	videoStr       *media.Streamer
+	cycle          *media.Streams // current source cycle, see handleStreamerEnd
 	connected      chan struct{}
 	srcEncOpt      media.EncodeOptions
 	chatID         int64
@@ -52,19 +53,17 @@ type GroupCall struct {
 	connectedOnce sync.Once
 	netState      atomic.Int32 // models.ConnState
 	closed        atomic.Bool
-	switching     atomic.Bool // true while SetSource is replacing the source; suppresses OnStreamEnd for the old streamer
 	connectCalled atomic.Bool
 	paused        bool
 	muted         bool
 	videoOff      bool
-	// Per-cycle stream-end state. Reset by SetSource / startLocked.
-	// endedOnce ensures only the first leg to EOF fires OnStreamEnd; the
-	// second leg is force-stopped and its EOF suppressed. hadAudio /
-	// hadVideo are captured at cycle-start so the user gets the right
-	// events even after fields are cleared.
-	endedOnce bool
-	hadAudio  bool
-	hadVideo  bool
+	// Per-cycle stream-end state, set by installLocked. A source cycle is
+	// identified by its *media.Streams: an end event whose cycle is no
+	// longer g.cycle (replaced by SetSource/SeekBy, or already ended by
+	// the sibling leg) is stale. hadAudio / hadVideo are captured at
+	// cycle-start so the user gets the right events after fields clear.
+	hadAudio bool
+	hadVideo bool
 }
 
 // NewGroupCall constructs a fresh call. Caller threads pion factory + logger.
@@ -164,20 +163,16 @@ func (g *GroupCall) SetSource(ctx context.Context, src media.Source) error {
 		srcEncOpt = sp.EncodeOpts()
 	}
 
-	// Snapshot the state needed for the prepare phase. We RLock briefly
-	// just for the read; the actual swap happens under a write Lock in
-	// phase 2.
-	g.mu.RLock()
-	muted := g.muted
-	videoOff := g.videoOff
-	g.mu.RUnlock()
-
 	// Phase 1 (OUTSIDE g.mu): spawn ffmpeg + read OGG/IVF headers. The
 	// ivfreader/oggreader header parse blocks reading from ffmpeg's pipe
 	// until ffmpeg flushes its first page (200 ms-1 s on cold start), and
 	// holding g.mu across that window stalls every concurrent Pause /
 	// Mute / GetState / ElapsedMs caller for the same call.
-	streams, audioStr, videoStr, err := g.prepareStreamers(ctx, src, srcEncOpt, muted, videoOff)
+	streams, err := src.Open(ctx)
+	if err != nil {
+		return fmt.Errorf("open source: %w", err)
+	}
+	audioStr, videoStr, err := g.prepareStreamers(ctx, streams, srcEncOpt)
 	if err != nil {
 		return err
 	}
@@ -228,33 +223,13 @@ func (g *GroupCall) SetSource(ctx context.Context, src media.Source) error {
 		return models.ErrClosed
 	}
 
-	g.switching.Store(true)
-	defer g.switching.Store(false)
-
+	// The old cycle's end events turn stale once g.streams changes, so
+	// replacing a source never fires OnStreamEnd for it.
 	g.stopStreamersLocked()
 	g.src = src
 	g.resumeMs = 0
 	g.srcEncOpt = srcEncOpt
-	g.streams = streams
-	g.audioStr = audioStr
-	g.videoStr = videoStr
-	// Arm the per-cycle stream-end guard for the freshly installed pair.
-	g.endedOnce = false
-	g.hadAudio = audioStr != nil
-	g.hadVideo = videoStr != nil
-	paused := g.paused
-	if audioStr != nil {
-		if paused {
-			audioStr.SetPaused(true)
-		}
-		audioStr.Start()
-	}
-	if videoStr != nil {
-		if paused {
-			videoStr.SetPaused(true)
-		}
-		videoStr.Start()
-	}
+	g.installLocked(streams, audioStr, videoStr)
 	g.mu.Unlock()
 	// Intentionally no OnUpgrade fire here — SetSource is user-initiated,
 	// the caller already knows they're switching to a video source (same
@@ -263,14 +238,17 @@ func (g *GroupCall) SetSource(ctx context.Context, src media.Source) error {
 	return nil
 }
 
-// prepareStreamers spawns the source's ffmpeg leg(s) and constructs (but
-// does NOT Start) the Streamers. Runs outside g.mu so the ffmpeg-header
-// wait doesn't block other concurrent operations on the same call.
-func (g *GroupCall) prepareStreamers(ctx context.Context, src media.Source, encOpt media.EncodeOptions, muted, videoOff bool) (*media.Streams, *media.Streamer, *media.Streamer, error) {
-	streams, err := src.Open(ctx)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("open source: %w", err)
-	}
+// firstPageTimeout bounds the wait for a source's first OGG/IVF page. A
+// hung ffmpeg (e.g. a stalled HTTP input without -rw_timeout) would
+// otherwise block SetSource, or Resume/SeekBy under g.mu, forever.
+const firstPageTimeout = 30 * time.Second
+
+// prepareStreamers parses the headers of freshly opened streams and
+// constructs (but does NOT Start) the Streamers. Runs outside g.mu from
+// SetSource so the ffmpeg-header wait doesn't block other concurrent
+// operations on the same call. Closes streams on error.
+func (g *GroupCall) prepareStreamers(ctx context.Context, streams *media.Streams, encOpt media.EncodeOptions) (*media.Streamer, *media.Streamer, error) {
+	stall := time.AfterFunc(firstPageTimeout, func() { _ = streams.Close() })
 	var audioStr, videoStr *media.Streamer
 	if streams.Audio != nil {
 		fr, frErr := media.NewOpusFrameReader(streams.Audio)
@@ -280,12 +258,9 @@ func (g *GroupCall) prepareStreamers(ctx context.Context, src media.Source, encO
 			// Debug. The video leg (if any) still plays.
 			g.log.Warn("audio track unavailable, skipping", slog.Any("err", frErr))
 		} else {
-			var s *media.Streamer
-			s = media.NewStreamer(ctx, fr, g.pc.AudioTrack(), g.log, func(endErr error) {
-				g.handleStreamerEnd(models.Audio, models.Microphone, endErr, s)
+			audioStr = media.NewStreamer(ctx, fr, g.pc.AudioTrack(), g.log, func(endErr error) {
+				g.handleStreamerEnd(models.Audio, models.Microphone, endErr, streams)
 			})
-			s.SetMuted(muted)
-			audioStr = s
 		}
 	}
 	if streams.Video != nil {
@@ -299,25 +274,46 @@ func (g *GroupCall) prepareStreamers(ctx context.Context, src media.Source, encO
 			// /vplay and video never started". Visible at default Info.
 			g.log.Warn("video track unavailable, skipping", slog.Any("err", frErr))
 		} else {
-			var s *media.Streamer
-			s = media.NewStreamer(ctx, fr, g.pc.VideoTrack(), g.log, func(endErr error) {
-				g.handleStreamerEnd(models.Video, models.Camera, endErr, s)
+			videoStr = media.NewStreamer(ctx, fr, g.pc.VideoTrack(), g.log, func(endErr error) {
+				g.handleStreamerEnd(models.Video, models.Camera, endErr, streams)
 			})
-			s.SetMuted(videoOff)
-			videoStr = s
 		}
+	}
+	if !stall.Stop() {
+		return nil, nil, fmt.Errorf("%w: no media from the source within %s", models.ErrFile, firstPageTimeout)
 	}
 	if audioStr == nil && videoStr == nil {
 		_ = streams.Close()
-		return nil, nil, nil, fmt.Errorf("%w: source has no playable audio or video stream", models.ErrFile)
+		return nil, nil, fmt.Errorf("%w: source has no playable audio or video stream", models.ErrFile)
 	}
-	return streams, audioStr, videoStr, nil
+	return audioStr, videoStr, nil
 }
 
-// startLocked is kept as a thin wrapper used by Resume to rehydrate
-// streamers after a Pause-time tear-down. (Today Pause keeps streamers
-// alive via SetPaused, so startLocked only ever runs from a Resume that
-// finds them nil — typically because SetSource was called while paused.)
+// installLocked makes streams the current source cycle and starts its
+// streamers with the call's current pause / mute state, so a Mute that
+// landed while SetSource was preparing is not lost. Caller holds g.mu.
+func (g *GroupCall) installLocked(streams *media.Streams, audioStr, videoStr *media.Streamer) {
+	g.streams = streams
+	g.cycle = streams
+	g.audioStr = audioStr
+	g.videoStr = videoStr
+	g.hadAudio = audioStr != nil
+	g.hadVideo = videoStr != nil
+	if audioStr != nil {
+		audioStr.SetMuted(g.muted)
+		audioStr.SetPaused(g.paused)
+		audioStr.Start()
+	}
+	if videoStr != nil {
+		videoStr.SetMuted(g.videoOff)
+		videoStr.SetPaused(g.paused)
+		videoStr.Start()
+	}
+}
+
+// startLocked reopens g.src (at resumeMs when seekable) and installs it
+// as a new cycle. Used by Resume when no streamers exist (e.g. after an
+// ICE-failure teardown) and by SeekBy. Caller holds g.mu.
 func (g *GroupCall) startLocked(ctx context.Context) error {
 	if g.src == nil {
 		return nil
@@ -334,60 +330,11 @@ func (g *GroupCall) startLocked(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
-	g.streams = streams
-
-	var audioOK, videoOK bool
-	if streams.Audio != nil {
-		fr, frErr := media.NewOpusFrameReader(streams.Audio)
-		if frErr != nil {
-			g.log.Warn("audio track unavailable, skipping", slog.Any("err", frErr))
-		} else {
-			var s *media.Streamer
-			s = media.NewStreamer(ctx, fr, g.pc.AudioTrack(), g.log, func(endErr error) {
-				g.handleStreamerEnd(models.Audio, models.Microphone, endErr, s)
-			})
-			s.SetMuted(g.muted)
-			if g.paused {
-				s.SetPaused(true)
-			}
-			s.Start()
-			g.audioStr = s
-			audioOK = true
-		}
+	audioStr, videoStr, err := g.prepareStreamers(ctx, streams, g.srcEncOpt)
+	if err != nil {
+		return err
 	}
-	if streams.Video != nil {
-		fps := g.srcEncOpt.VideoFPS
-		if fps <= 0 {
-			fps = 30
-		}
-		fr, frErr := media.NewVP8FrameReader(streams.Video, fps)
-		if frErr != nil {
-			g.log.Warn("video track unavailable, skipping", slog.Any("err", frErr))
-		} else {
-			var s *media.Streamer
-			s = media.NewStreamer(ctx, fr, g.pc.VideoTrack(), g.log, func(endErr error) {
-				g.handleStreamerEnd(models.Video, models.Camera, endErr, s)
-			})
-			s.SetMuted(g.videoOff)
-			if g.paused {
-				s.SetPaused(true)
-			}
-			s.Start()
-			g.videoStr = s
-			videoOK = true
-		}
-	}
-	if !audioOK && !videoOK {
-		_ = streams.Close()
-		g.streams = nil
-		return fmt.Errorf("%w: source has no playable audio or video stream", models.ErrFile)
-	}
-	// Arm the per-cycle stream-end guard. We hold g.mu, so any EOF
-	// dispatched from a streamer that EOF'd between Start and here will
-	// block at the closure's g.mu.Lock() until this returns.
-	g.endedOnce = false
-	g.hadAudio = audioOK
-	g.hadVideo = videoOK
+	g.installLocked(streams, audioStr, videoStr)
 	return nil
 }
 
@@ -406,74 +353,56 @@ func (g *GroupCall) stopStreamersLocked() {
 	}
 }
 
-// handleStreamerEnd is the per-streamer onEnd callback. Receives the
-// streamer pointer captured at construction so the dispatched cleanup
-// can verify the ended streamer is still the current one before firing
-// (concurrent SetSource may have already replaced it).
+// handleStreamerEnd is the per-streamer onEnd callback. cycle is the
+// *media.Streams the streamer was built from; the dispatched closure only
+// fires if that cycle is still current, so ends from a replaced source
+// or the second leg of the same source are dropped.
 //
 // For a video+audio source, the first leg to EOF wins the right to fire.
-// The sibling streamer is force-stopped and its own EOF is suppressed by
-// the endedOnce guard. The user gets two OnStreamEnd events in fixed
-// order — Video then Audio — regardless of which leg ended first.
-// Audio-only sources fire a single Audio event; video-only sources fire
-// a single Video event.
-func (g *GroupCall) handleStreamerEnd(t models.StreamType, d models.Device, err error, str *media.Streamer) {
+// The sibling streamer is force-stopped and its own EOF is stale. The
+// user gets two OnStreamEnd events in fixed order — Video then Audio —
+// regardless of which leg ended first. Audio-only sources fire a single
+// Audio event; video-only sources fire a single Video event.
+func (g *GroupCall) handleStreamerEnd(t models.StreamType, d models.Device, err error, cycle *media.Streams) {
 	closed := g.closed.Load()
-	switching := g.switching.Load()
 	g.log.Debug("streamer end",
 		slog.Any("type", t), slog.Any("device", d), slog.Any("err", err),
-		slog.Bool("closed", closed), slog.Bool("switching", switching))
-	if closed || switching {
-		return
-	}
-	if g.disp == nil {
+		slog.Bool("closed", closed))
+	if closed || g.disp == nil {
 		return
 	}
 	g.disp.Submit(func() {
-		if g.closed.Load() || g.switching.Load() {
+		if g.closed.Load() {
 			return
 		}
 		g.mu.Lock()
-		// Stale dispatch: SetSource replaced this streamer with a
-		// different one before our closure ran. We detect that by the
-		// field being non-nil but pointing at a different Streamer.
-		// (PC-Failed cleanup nils the field externally — that path
-		// should still fire, so we don't suppress on plain nil.)
-		isStale := (t == models.Audio && g.audioStr != nil && g.audioStr != str) ||
-			(t == models.Video && g.videoStr != nil && g.videoStr != str)
-		if isStale || g.endedOnce {
+		if g.cycle != cycle {
 			g.mu.Unlock()
 			return
 		}
-		g.endedOnce = true
 		hadAudio := g.hadAudio
 		hadVideo := g.hadVideo
-		// Capture the sibling streamer (the one that did NOT end). The
-		// streamer that ended naturally needs no Stop call.
-		var siblingAudio, siblingVideo *media.Streamer
+		// The streamer that ended naturally needs no Stop call; its
+		// sibling is stopped below, outside the lock.
+		sibling := g.videoStr
 		if t == models.Video {
-			siblingAudio = g.audioStr
-		} else {
-			siblingVideo = g.videoStr
+			sibling = g.audioStr
 		}
-		g.audioStr = nil
-		g.videoStr = nil
+		g.audioStr, g.videoStr, g.streams, g.cycle = nil, nil, nil, nil
+		// The source is finished: a later Pause/Resume must not replay it.
+		g.src, g.resumeMs = nil, 0
 		// EOF doesn't fire OnUpgrade — OnStreamEnd already signals
 		// end-of-stream and the caller drives any MTProto state change
 		// from there.
 		fn := g.ev.OnStreamEnd
 		g.mu.Unlock()
 
-		// Stop the sibling outside the lock. Streamer.Stop blocks until
-		// its run goroutine exits; that exit fires onEnd which dispatches
-		// a handleStreamerEnd whose closure sees endedOnce=true (or
-		// isCurrent=false because we cleared the field) and returns.
-		if siblingVideo != nil {
-			siblingVideo.Stop()
+		// Streamer.Stop blocks until its run goroutine exits; that exit
+		// dispatches an end event for this cycle, which is now stale.
+		if sibling != nil {
+			sibling.Stop()
 		}
-		if siblingAudio != nil {
-			siblingAudio.Stop()
-		}
+		_ = cycle.Close()
 
 		if fn == nil {
 			return
@@ -685,22 +614,34 @@ func (g *GroupCall) SeekBy(deltaMs int64) error {
 	}
 	target := int64(g.resumeMs+streamerMs) + deltaMs
 	if target < 0 {
-		// Underflow → force EOF. stopStreamersLocked triggers each
-		// streamer's onEnd which dispatches OnStreamEnd through the
-		// normal handleStreamerEnd path (endedOnce is still false from
-		// startLocked, so the first leg fires).
+		// Underflow ends the source like EOF: stop it and fire
+		// OnStreamEnd explicitly (clearing the cycle makes the stopped
+		// legs' own end events stale).
+		hadAudio, hadVideo := g.hadAudio, g.hadVideo
 		g.stopStreamersLocked()
+		g.cycle = nil
+		g.src, g.resumeMs = nil, 0
+		fn := g.ev.OnStreamEnd
 		g.mu.Unlock()
+		if fn != nil && g.disp != nil {
+			g.disp.Submit(func() {
+				if g.closed.Load() {
+					return
+				}
+				if hadVideo {
+					fn(models.Video, models.Camera, nil)
+				}
+				if hadAudio {
+					fn(models.Audio, models.Microphone, nil)
+				}
+			})
+		}
 		return nil
 	}
-	// Normal seek: suppress the old streamers' EOF dispatches via
-	// switching, kill them, advance resumeMs, reopen via OpenAt. The
-	// switching flag is cleared after Unlock by defer (mirrors
-	// SetStreamSources — any race window during new-streamer Start is
-	// the same one SetStreamSources accepts).
-	g.switching.Store(true)
-	defer g.switching.Store(false)
+	// Normal seek: kill the old streamers (their end events go stale
+	// with the cycle), advance resumeMs, reopen via OpenAt.
 	g.stopStreamersLocked()
+	g.cycle = nil
 	g.resumeMs = uint64(target)
 	err := g.startLocked(context.Background())
 	g.mu.Unlock()
