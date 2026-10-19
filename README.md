@@ -60,7 +60,7 @@ That's a working voice-chat playback bot. Everything else in this README is opti
 - **ntgcalls-shaped API.** `CreateCall` / `Connect` / `SetStreamSources` / `Pause` / `Resume` / `Mute` / `SeekBy` / `Stop` — existing bot code translates line-for-line.
 - **Three source modes.** `FromFile`, `FromURL`, `FromShell` — anything ffmpeg can decode is fair game (HLS, RTSP, RTMP, MJPEG, screen capture, …).
 - **WebRTC + RTMP push.** Group voice/video chats *and* "go live" RTMP broadcasts via one client.
-- **Scales to tens of thousands of calls** per process with `WithSharedUDPMux` + raised FD limits.
+- **No hardcoded call limit.** The ceiling is ffmpeg's CPU and RAM, not the library — see [scaling ballparks](#concurrency--scaling-ballparks).
 
 ## At a glance
 
@@ -456,7 +456,7 @@ gotgcall.New(
     gotgcall.WithLogger(slog.Default()),                // structured logger
     gotgcall.WithDebugLogs(),                           // shortcut: text handler @ Debug level to stderr
     gotgcall.WithFFmpegStderrLog(),                     // tee ffmpeg stderr → debug log
-    gotgcall.WithSharedUDPMux(),                        // one UDP socket for all calls
+    gotgcall.WithSharedUDPMux(),                        // one UDP4 socket for all calls (rarely needed)
     gotgcall.WithDTLSCertPool(16),                      // pre-generate N DTLS certs
     gotgcall.WithDispatchBuffer(512),                   // event-dispatcher initial queue capacity
     gotgcall.WithNetworkTypes(                          // enable IPv6/TCP for restrictive nets
@@ -473,7 +473,7 @@ gotgcall.New(
 | `WithLogger` | **discard** (no logs at all) | Pass a `*slog.Logger` to receive gotgcall events plus ffmpeg stderr/exit. Without this, every log call — Info, Warn, Error — is silently dropped. |
 | `WithDebugLogs` | off | Convenience shortcut for debug-level slog to stderr. Use when reporting bugs. |
 | `WithFFmpegStderrLog` | off | Tees ffmpeg stderr line-by-line into the logger. Helpful for "stream runs but I hear nothing" diagnostics. |
-| `WithSharedUDPMux` | off | Multiplex every call through one UDP socket. See [UDP mux scaling](#udp-mux--scaling). |
+| `WithSharedUDPMux` | off | Multiplex every call through one UDP4 socket. Rarely needed — see [UDP mux & scaling](#udp-mux--scaling). |
 | `WithDTLSCertPool` | 8 | Pre-generate N DTLS certs so `CreateCall` doesn't stall during bursts. 0 = disabled. |
 | `WithDispatchBuffer` | 256 | Initial callback-queue capacity. The queue grows as needed; events are never dropped. |
 | `WithNetworkTypes` | UDP4+UDP6 | Override the candidate network-type whitelist. Add TCP for environments where UDP is blocked. |
@@ -495,27 +495,22 @@ client, err := gotgcall.New(
 
 ### UDP mux & scaling
 
-The README said "use `WithSharedUDPMux` at 100+ calls". That was a conservative guess — the real picture:
+**You almost certainly don't need `WithSharedUDPMux`.** All it saves is file descriptors and ports, and those aren't what limits a bot.
 
-**Default (one socket per call):**
-- 1 UDP socket = 1 file descriptor + 1 ephemeral port per call.
-- Linux defaults: `ulimit -n 1024` (raise to 65535), ephemeral port range `32768–60999` (~28000 usable).
-- Practical ceiling **without** any tuning: ~900 calls (bounded by FDs, leaving room for other FDs).
-- After `ulimit -n 65535` and `net.ipv4.ip_local_port_range="1024 65000"`: **tens of thousands** of calls on a beefy server.
-- Benefit: kernel-level UDP receive-queue per call, parallelism scales with CPU cores naturally.
+**Default (per-call sockets):**
+- Each call's ICE agent opens its own UDP socket(s); `Stop` closes them.
+- Each call also runs 1–2 ffmpeg processes, and each one already holds 2–3 FDs in your process (stdout pipe, stderr pipe, process handle). The socket is one FD out of several.
+- Hit `too many open files`? Raise the limit (`ulimit -n 65535`). That covers ffmpeg's FDs and the sockets together.
+- Each call gets its own kernel receive queue, so one busy call can't crowd out another.
 
-**`WithSharedUDPMux` (one socket total):**
-- 1 UDP socket, 1 FD, 1 port for the entire process — FD/port limits stop mattering.
-- All traffic funnels through one socket → kernel UDP buffer might become contended at extreme rates.
-- Per-socket UDP throughput on modern Linux: easily 1–10 Gbps. At ~50 kbps per voice call, that's **20 000–200 000 concurrent voice calls** through one socket before throughput becomes the bottleneck.
-- Best for huge call counts where FD/port pressure is the limiting factor, or where firewall rules need to pin a single port.
+**`WithSharedUDPMux` (one socket for the process):**
+- Every call goes through one `udp4` socket on a random port. `Stop` never touches it; only `client.Close()` closes it.
+- **UDP4 only** — IPv6 candidates are dropped even if `WithNetworkTypes` enables UDP6.
+- **Skips the interface filter.** The socket listens on all addresses, and pion then advertises every local IP, including Docker bridges and VPN interfaces that are normally filtered out (see [Networking](#networking)).
+- One kernel receive buffer for every call. At very high counts, raise `net.core.rmem_max` / `net.core.rmem_default`.
+- The port is random and not configurable, so it does **not** help you pin a firewall port.
 
-**Rule of thumb:**
-- < 1000 calls: per-call sockets is fine, simpler, and gives you natural per-call kernel-queue isolation.
-- 1000–10000 calls: either works; `WithSharedUDPMux` simplifies sysctl tuning.
-- 10000+ calls: `WithSharedUDPMux` is the easier path; tune the kernel UDP receive buffer (`net.core.rmem_max`, `net.core.rmem_default`).
-
-**Note:** `client.Stop(chatID)` closes only that call's WebRTC stack (and the per-call socket if not using the shared mux). The shared mux survives every `Stop` and is only closed when you call `client.Close()` on the parent client. So you can spin calls up and down freely without leaking or thrashing the shared socket.
+**When to turn it on:** only if you've already raised `ulimit -n` and still run out of FDs or ephemeral ports. In practice ffmpeg's CPU and RAM run out first (see [scaling ballparks](#concurrency--scaling-ballparks)).
 
 ## Lifecycle
 
@@ -681,7 +676,7 @@ Scales linearly with live calls; nothing is allocated per-source-switch or per-f
 - **Transport:** UDP4 + UDP6 by default. Override with `WithNetworkTypes(...)` to restrict or add TCP.
 - **STUN / TURN:** not exposed — host candidates only, matching ntgcalls. Telegram's edge learns our post-NAT source peer-reflexively as ICE-CONTROLLED, so STUN adds nothing for this flow.
 - **Interface filter:** virtual / VPN interfaces (Docker bridges, WSL, VMware, Tailscale, ZeroTier, OpenVPN, etc.) are skipped automatically. Override is not exposed; report a bug if your interface name is being filtered incorrectly.
-- **UDP mux:** default = one socket per call. Pass `WithSharedUDPMux()` to multiplex all calls through one `udp4:0` socket (recommended once you're above ~1 000 concurrent calls — see [UDP mux & scaling](#udp-mux--scaling)).
+- **UDP mux:** default = one socket per call. `WithSharedUDPMux()` puts every call on one random-port `udp4` socket; it drops IPv6 and skips the interface filter, so leave it off unless FDs/ports run out after raising `ulimit -n` — see [UDP mux & scaling](#udp-mux--scaling).
 - **Connect gate:** `SetSource` waits up to 10 s for the call to reach Connected before returning `ErrNotConnected`. Override with `WithConnectTimeout(...)`.
 - **ICE timeouts:** internal — 10 s disconnect grace, 30 s failed, 2 s keepalive. Not user-tunable; matches ntgcalls.
 
@@ -689,7 +684,6 @@ Scales linearly with live calls; nothing is allocated per-source-switch or per-f
 
 - **Cert pool** (`WithDTLSCertPool`): default 8; raise for very bursty workloads so `CreateCall` doesn't block on keygen.
 - **Dispatch buffer** (`WithDispatchBuffer`): default 256, the queue's initial capacity. It grows on bursts; raising it only avoids early reallocations.
-- **Shared UDP mux** (`WithSharedUDPMux`): cuts FD use once you're above ~1 000 concurrent calls.
 - **Fast cold-start:** `FromFile` / `FromURL` already inject `-analyzeduration 0 -probesize 64k` to cut ~1–2 s from ffmpeg startup. Add the same flags in your `FromShell` commands if cold-start matters.
 
 ### Memory usage
@@ -710,7 +704,7 @@ Audio-only is the cheap path. The 25–40 MB number for video is ffmpeg's encode
 | Concurrent calls | Recommended tuning |
 | --- | --- |
 | 1–100 | Defaults. Don't touch anything. |
-| 100–1 000 | `WithSharedUDPMux()`. Raise FD limit (`ulimit -n 65535`). |
+| 100–1 000 | Raise FD limit (`ulimit -n 65535`). |
 | 1 000–10 000 | Above + `WithDTLSCertPool(64)`, `WithDispatchBuffer(4096)`. Pin GOMAXPROCS. Watch ffmpeg total RSS — this is the bottleneck. |
 | 10 000+ | Above + shard across processes; ffmpeg memory dominates at this scale. |
 
@@ -765,7 +759,7 @@ Both use the same codecs at the same bitrates against the same SFU, so wire band
 | Cross-compile / deploy       | libwebrtc + glibc + C++ toolchain + cgo       | `CGO_ENABLED=0 go build` → single static binary → scp → run  |
 | Binary size                  | ~20–30 MB                                     | ~12–18 MB                                                    |
 | Pause/resume                 | Sub-ms                                        | WebRTC: sub-ms · RTMP: ~100–300 ms gap                       |
-| Concurrent calls per process | ~hundreds without tuning                      | Tens of thousands with `WithSharedUDPMux` + raised FDs       |
+| Concurrent calls per process | ~hundreds without tuning                      | Bounded by ffmpeg CPU/RAM; raise `ulimit -n` past ~900       |
 | Hot-reload of encoder logic  | Recompile + redeploy                          | Swap an ffmpeg flag string at runtime                        |
 
 **The library itself is leaner in gotgcall** — well under a percent of CPU and a few MB of heap per call. The full-pipeline number is higher because ffmpeg is counted; that subprocess cost is bounded (`-threads 1`), inspectable (`ps`, `top`), and isolated (an ffmpeg crash doesn't take the bot down).
@@ -775,7 +769,7 @@ Both use the same codecs at the same bitrates against the same SFU, so wire band
 - ntgcalls is leaner per call (no subprocess overhead).
 - gotgcall is dramatically easier to deploy and customise (static binary, ffmpeg-flag flexibility).
 - For typical music bots (10–500 concurrent calls), the per-call difference is invisible.
-- For 10 000+ concurrent calls, ntgcalls' lower memory footprint matters; `WithSharedUDPMux` closes part of that gap.
+- For 10 000+ concurrent calls, ntgcalls' lower memory footprint matters.
 
 Numbers are order-of-magnitude estimates — benchmark your workload.
 
@@ -836,7 +830,7 @@ Yes. Pure-Go means no Make/gcc/clang. Pause/Resume in WebRTC mode uses a channel
 <details>
 <summary><b>How many concurrent calls can one process handle?</b></summary>
 
-The library has no hardcoded limit. The practical ceiling is ffmpeg subprocess count + ICE socket count. Use `WithSharedUDPMux()` to collapse all calls onto one UDP socket once you're above ~100 concurrent calls. See [UDP mux & scaling](#udp-mux--scaling).
+The library has no hardcoded limit. The practical ceiling is ffmpeg's CPU and RAM — see [scaling ballparks](#concurrency--scaling-ballparks). Past ~900 calls, raise `ulimit -n`; you don't need `WithSharedUDPMux` for that ([why](#udp-mux--scaling)).
 </details>
 
 <details>

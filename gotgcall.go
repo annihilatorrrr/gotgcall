@@ -142,8 +142,9 @@ func WithFFmpegPath(p string) Option {
 	}
 }
 
-// WithSharedUDPMux makes all calls share one UDP socket for ICE traffic.
-// Useful for high-concurrency setups (100+ simultaneous calls).
+// WithSharedUDPMux makes all calls share one UDP4 socket for ICE traffic.
+// It only saves FDs/ports, drops IPv6 and skips the interface filter, so
+// raise `ulimit -n` first; see README "UDP mux & scaling".
 func WithSharedUDPMux() Option {
 	return func(c *config) { c.sharedUDPMux = true }
 }
