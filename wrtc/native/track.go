@@ -38,9 +38,10 @@ const (
 //     atomic.Pointer so the hot path reads it lock-free.
 //   - writeMu serialises writePackets calls within a single Track so
 //     the streamer goroutine and the keepalive goroutine cannot mutate
-//     absSendBuf concurrently (SetExtension stores the slice by
+//     absSendBuf / extBuf concurrently (SetExtension stores the slice by
 //     reference; pion/rtp marshals it during the subsequent SRTP write,
-//     so the buffer is in-flight until WriteRTP returns).
+//     and EncryptRTP re-parses the header back into extBuf, so both are
+//     in-flight until WriteRTP returns).
 //   - The mutex is per-Track. Audio and video Tracks have independent
 //     mutexes; the shared SRTP context further down still serializes
 //     encryption across both via Stack.srtpWriteMu.
@@ -50,6 +51,7 @@ type Track struct {
 	mid         string
 	absSendBuf  []byte
 	midBuf      []byte
+	extBuf      [3]rtp.Extension // backing array for every packet's Extensions
 	writeMu     sync.Mutex
 	kind        Kind
 	ssrc        uint32
@@ -116,7 +118,8 @@ func (t *Track) SSRC() uint32 { return t.ssrc }
 
 // WriteSample packetises and sends one encoded frame.
 func (t *Track) WriteSample(s media.Sample) error {
-	samples := uint32(s.Duration.Seconds() * float64(t.clockRate))
+	// Integer math: the float form truncates e.g. 60 ms to 2879 ticks.
+	samples := uint32(s.Duration * time.Duration(t.clockRate) / time.Second)
 	pkts := t.packetizer.Packetize(s.Data, samples)
 	if len(pkts) == 0 {
 		return nil
@@ -173,7 +176,7 @@ func (t *Track) writePackets(pkts []*rtp.Packet) error {
 // from the track (silence boundary), false thereafter.
 func (t *Track) stampExtensions(h *rtp.Header, firstOfFrame bool) {
 	h.Extension = false
-	h.Extensions = nil
+	h.Extensions = t.extBuf[:0]
 
 	if t.kind == KindAudio {
 		// audio-level: voice-activity bit (0x80) | level in -dBov (20).

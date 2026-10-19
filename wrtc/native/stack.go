@@ -66,8 +66,10 @@ type Stack struct {
 	ufrag string
 	pwd   string
 
-	// reusable per-packet encryption buffer; resized as needed and
-	// shared between audio + video writes under srtpWriteMu.
+	// reusable per-packet plaintext (marshalBuf) and ciphertext
+	// (encryptBuf) buffers; resized as needed and shared between
+	// audio + video writes under srtpWriteMu.
+	marshalBuf []byte
 	encryptBuf []byte
 
 	onStateChangeMu sync.RWMutex
@@ -514,7 +516,8 @@ func (s *Stack) transitionTo(next models.ConnState) {
 // srtpWriter adapts the encrypt-only srtp.Context to the
 // srtp.WriteStreamSRTP interface our Tracks consume. The session-level
 // type pulls in a read loop + goroutine we have no use for; this shim
-// stays synchronous and shares the encryptBuf scratch across packets.
+// stays synchronous and shares the marshalBuf/encryptBuf scratch across
+// packets.
 type srtpWriter struct {
 	stack *Stack
 }
@@ -532,14 +535,24 @@ func (w *srtpWriter) WriteRTP(header *rtp.Header, payload []byte) (int, error) {
 		return 0, fmt.Errorf("srtp not ready")
 	}
 
-	pkt := &rtp.Packet{Header: *header, Payload: payload}
-	plaintext, err := pkt.Marshal()
-	if err != nil {
-		return 0, err
-	}
+	pkt := rtp.Packet{Header: *header, Payload: payload}
 
 	s.srtpWriteMu.Lock()
-	cipher, err := s.srtpCtx.EncryptRTP(s.encryptBuf[:0], plaintext, header)
+	size := pkt.MarshalSize()
+	if cap(s.marshalBuf) < size {
+		s.marshalBuf = make([]byte, size)
+	}
+	// Zeroed like Marshal's fresh buffer: MarshalTo skips the padding
+	// bytes of GeneratePadding packets. EncryptRTP only reads plaintext
+	// and writes into encryptBuf, so neither escapes the lock.
+	plaintext := s.marshalBuf[:size]
+	clear(plaintext)
+	m, err := pkt.MarshalTo(plaintext)
+	if err != nil {
+		s.srtpWriteMu.Unlock()
+		return 0, err
+	}
+	cipher, err := s.srtpCtx.EncryptRTP(s.encryptBuf[:0], plaintext[:m], header)
 	if err != nil {
 		s.srtpWriteMu.Unlock()
 		return 0, err

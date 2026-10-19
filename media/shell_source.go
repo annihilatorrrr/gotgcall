@@ -25,6 +25,9 @@ import (
 //   - output-side flags (`-c:a libopus`, `-f ogg`, opus pacing/codec
 //     params, `pipe:1`) for audio, or (`-c:v libvpx`, `-f ivf`, `pipe:1`)
 //     for video, are appended if not already present.
+//   - with `-c:a copy` only the OGG muxer flags are added, so an input
+//     that is already Opus streams without being re-encoded. Anything
+//     else fails the OpusHead check with ErrFile.
 //
 // Raw PCM output codecs (pcm_s16le, etc.) are still rejected up front
 // since the frame readers can't parse them.
@@ -82,25 +85,27 @@ func ensureFFmpegFlags(args []string, track Track) []string {
 	var outputInject []string
 	switch {
 	case track.Has(TrackAudio):
-		if !has["-c:a"] && !has["-acodec"] {
+		// Encoder and resampler flags conflict with stream copy.
+		enc := !copiesAudio(args)
+		if enc && !has["-c:a"] && !has["-acodec"] {
 			outputInject = append(outputInject, "-c:a", "libopus")
 		}
-		if !has["-application"] {
+		if enc && !has["-application"] {
 			outputInject = append(outputInject, "-application", "audio")
 		}
-		if !has["-frame_duration"] {
+		if enc && !has["-frame_duration"] {
 			outputInject = append(outputInject, "-frame_duration", "20")
 		}
 		if !has["-page_duration"] {
 			outputInject = append(outputInject, "-page_duration", "20000")
 		}
-		if !has["-mapping_family"] {
+		if enc && !has["-mapping_family"] {
 			outputInject = append(outputInject, "-mapping_family", "0")
 		}
-		if !has["-ar"] {
+		if enc && !has["-ar"] {
 			outputInject = append(outputInject, "-ar", "48000")
 		}
-		if !has["-ac"] {
+		if enc && !has["-ac"] {
 			outputInject = append(outputInject, "-ac", "2")
 		}
 		if !has["-f"] {
@@ -140,6 +145,19 @@ func ensureFFmpegFlags(args []string, track Track) []string {
 	out = append(out, outputInject...)
 	out = append(out, "pipe:1")
 	return out
+}
+
+// copiesAudio reports whether the last audio codec option in argv is
+// "copy" (-c, -codec, -c:a, -codec:a or -acodec).
+func copiesAudio(args []string) bool {
+	cp := false
+	for i := 0; i+1 < len(args); i++ {
+		switch args[i] {
+		case "-c", "-codec", "-c:a", "-codec:a", "-acodec":
+			cp = args[i+1] == "copy"
+		}
+	}
+	return cp
 }
 
 // validateOutputCodec scans argv for combinations known to produce output

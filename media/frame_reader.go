@@ -1,7 +1,10 @@
 package media
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	stdio "io"
 	"time"
@@ -24,49 +27,217 @@ type frameReader interface {
 // --- Opus -----------------------------------------------------------------
 
 func newOpusFrameReader(r stdio.Reader) (frameReader, error) {
-	ogg, _, err := oggreader.NewWith(r)
-	if err != nil {
+	// One buffered read covers many 20 ms pages instead of 3 read
+	// syscalls per page.
+	br := bufio.NewReaderSize(r, 8192)
+	// pion validates the OpusHead page. It reads exactly one page, so br
+	// is left aligned on the next page for nextPage.
+	if _, _, err := oggreader.NewWith(br); err != nil {
 		if c, ok := r.(stdio.Closer); ok {
 			_ = c.Close()
 		}
 		return nil, fmt.Errorf("%w: ogg parse: %v", models.ErrFile, err)
 	}
-	return &opusFrameReader{src: r, ogg: ogg}, nil
+	return &opusFrameReader{src: r, br: br}, nil
 }
 
 type opusFrameReader struct {
 	src           stdio.Reader
-	ogg           *oggreader.OggReader
+	br            *bufio.Reader
+	payload       []byte // body of the current page
+	lacing        []byte // lacing values of the current page not consumed yet
+	carry         []byte // a packet continued from the previous page
+	off           int    // offset in payload of the next packet
+	header        [27]byte
+	segments      [255]byte
 	skippedHeader bool
 	skippedTags   bool
 }
 
+// Next returns one Opus packet per call, timed from its own TOC byte, so
+// sources passed through with -c:a copy (10/40/60 ms frames, several
+// packets per page) pace as correctly as ffmpeg's 20 ms libopus output.
+// Data aliases a reused buffer and is only valid until the following
+// Next call. Safe for the Streamer: it calls WriteSample synchronously
+// and pion's OpusPayloader copies the frame.
 func (o *opusFrameReader) Next(ctx context.Context) (media.Sample, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return media.Sample{}, err
 		}
-		payload, _, err := o.ogg.ParseNextPage()
+		pkt, err := o.nextPacket()
 		if err != nil {
 			return media.Sample{}, err
 		}
-		if len(payload) >= 8 {
-			head := string(payload[:8])
-			if !o.skippedHeader && head == "OpusHead" {
-				o.skippedHeader = true
-				continue
-			}
-			if !o.skippedTags && head == "OpusTags" {
+		if !o.skippedTags && len(pkt) >= 8 {
+			switch string(pkt[:8]) {
+			case "OpusHead":
+				if !o.skippedHeader {
+					o.skippedHeader = true
+					continue
+				}
+			case "OpusTags":
 				o.skippedTags = true
 				continue
 			}
 		}
 		o.skippedHeader, o.skippedTags = true, true
-		return media.Sample{
-			Data:     payload,
-			Duration: time.Duration(models.OpusFrameDurationMs) * time.Millisecond,
-		}, nil
+		dur := opusPacketDuration(pkt)
+		if dur == 0 {
+			continue // empty or malformed: nothing a decoder could play
+		}
+		return media.Sample{Data: pkt, Duration: dur}, nil
 	}
+}
+
+// nextPacket returns the next whole Opus packet. A lacing value below
+// 255 ends a packet, so one page may hold several packets and a packet
+// may continue onto the next page (header flag 0x01). Packets inside one
+// page are returned as slices of the page buffer, without copying.
+func (o *opusFrameReader) nextPacket() ([]byte, error) {
+	o.carry = o.carry[:0]
+	partial, orphan := false, false
+	for {
+		if len(o.lacing) == 0 {
+			continued, err := o.nextPage()
+			if err != nil {
+				return nil, err
+			}
+			if !continued {
+				// A packet cut off by a fresh page can't be completed.
+				o.carry, partial, orphan = o.carry[:0], false, false
+			} else if !partial {
+				// Tail of a packet whose start was never seen.
+				orphan = true
+			}
+			continue
+		}
+		n, i, done := 0, 0, false
+		for i < len(o.lacing) {
+			v := o.lacing[i]
+			i++
+			n += int(v)
+			if v < 255 {
+				done = true
+				break
+			}
+		}
+		chunk := o.payload[o.off : o.off+n]
+		o.off += n
+		o.lacing = o.lacing[i:]
+		switch {
+		case orphan:
+			orphan = !done
+		case !done:
+			o.carry = append(o.carry, chunk...)
+			partial = true
+		case partial:
+			o.carry = append(o.carry, chunk...)
+			return o.carry, nil
+		default:
+			return chunk, nil
+		}
+	}
+}
+
+// nextPage reads one page into the reused buffers and reports whether
+// it continues a packet from the previous page. It is
+// oggreader.ParseNextPage without the per-page allocations. The CRC
+// check is kept so a corrupt or misaligned stream still errors out
+// instead of streaming garbage (nothing here decodes the Opus).
+func (o *opusFrameReader) nextPage() (continued bool, err error) {
+	h := o.header[:]
+	if _, err = stdio.ReadFull(o.br, h); err != nil {
+		return false, err
+	}
+	segs := o.segments[:h[26]]
+	if _, err = stdio.ReadFull(o.br, segs); err != nil {
+		return false, err
+	}
+	size := 0
+	for _, s := range segs {
+		size += int(s)
+	}
+	if cap(o.payload) < size {
+		o.payload = make([]byte, size)
+	}
+	payload := o.payload[:size]
+	if _, err = stdio.ReadFull(o.br, payload); err != nil {
+		return false, err
+	}
+	want := binary.LittleEndian.Uint32(h[22:26])
+	clear(h[22:26]) // the CRC field counts as zero in its own checksum
+	if oggCRC(oggCRC(oggCRC(0, h), segs), payload) != want {
+		return false, errOggChecksum
+	}
+	o.payload, o.lacing, o.off = payload, segs, 0
+	return h[5]&0x01 != 0, nil
+}
+
+// opusFrameSize is the frame length of each TOC config (RFC 6716 §3.1).
+var opusFrameSize = func() (t [32]time.Duration) {
+	for c := range t {
+		switch {
+		case c < 12: // SILK
+			t[c] = [4]time.Duration{10, 20, 40, 60}[c&3] * time.Millisecond
+		case c < 16: // Hybrid
+			t[c] = [2]time.Duration{10, 20}[c&1] * time.Millisecond
+		default: // CELT
+			t[c] = [4]time.Duration{2500, 5000, 10000, 20000}[c&3] * time.Microsecond
+		}
+	}
+	return t
+}()
+
+// opusPacketDuration is the playback length of one Opus packet from its
+// TOC byte (RFC 6716 §3.1-3.2), or 0 if it is empty or malformed.
+func opusPacketDuration(p []byte) time.Duration {
+	if len(p) == 0 {
+		return 0
+	}
+	frame := opusFrameSize[p[0]>>3]
+	var d time.Duration
+	switch p[0] & 3 {
+	case 0:
+		d = frame
+	case 1, 2:
+		d = 2 * frame
+	default:
+		if len(p) < 2 {
+			return 0
+		}
+		d = time.Duration(p[1]&0x3f) * frame
+	}
+	if d > 120*time.Millisecond {
+		return 0
+	}
+	return d
+}
+
+var errOggChecksum = errors.New("expected and actual checksum do not match")
+
+// oggCRCTable is the Ogg CRC-32 (poly 0x04c11db7, unreflected, so
+// hash/crc32 can't be used), built once per process.
+var oggCRCTable = func() (t [256]uint32) {
+	for i := range t {
+		r := uint32(i) << 24
+		for range 8 {
+			if r&0x80000000 != 0 {
+				r = r<<1 ^ 0x04c11db7
+			} else {
+				r <<= 1
+			}
+		}
+		t[i] = r
+	}
+	return t
+}()
+
+func oggCRC(crc uint32, b []byte) uint32 {
+	for _, v := range b {
+		crc = crc<<8 ^ oggCRCTable[byte(crc>>24)^v]
+	}
+	return crc
 }
 
 func (o *opusFrameReader) Close() error {
