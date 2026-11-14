@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/pion/dtls/v3 v3.1.15
-	github.com/pion/ice/v4 v4.4.8
+	github.com/pion/ice/v4 v4.4.9
 	github.com/pion/rtp v1.10.6
 	github.com/pion/srtp/v3 v3.1.3
 	github.com/pion/webrtc/v4 v4.2.26
